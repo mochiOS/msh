@@ -1,0 +1,13 @@
+api_version = 1
+id = "com.mochios.msh"
+name = "mochi shell"
+version = "0.1.0"
+entry = "/bin/msh"
+role = "application"
+
+[capabilities]
+requires = [
+    "fs.read.all",
+    "ipc.server",
+    "process.spawn",
+]

@@ -1,0 +1,19 @@
+[package]
+name = "msh"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[patch.crates-io]
+libc = { path = "../../libraries/libc" }
+
+[dependencies]
+libc = "0.2.185"
+mochi-user-syscall = { path = "../../user/crates/syscall" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
