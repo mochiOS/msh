@@ -150,6 +150,13 @@ fn run_command(line: &str) -> io::Result<bool> {
         }
         "cd" => {
             let target = argv.get(1).map(String::as_str).unwrap_or("/");
+            let path = std::path::Path::new(target);
+
+            if path.exists() && !path.is_dir() {
+                eprintln!("\"{target}\" isn't directory.");
+                return Ok(true);
+            }
+
             change_dir(target)?;
             Ok(true)
         }
