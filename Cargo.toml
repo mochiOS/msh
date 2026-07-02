@@ -6,7 +6,7 @@ edition = "2024"
 [workspace]
 
 [patch.crates-io]
-libc = { git = "https://github.com/mochiOS/libc" }
+libc = { path = "../../libraries/libc" }
 
 [dependencies]
 libc = "0.2.185"
