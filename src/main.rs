@@ -73,6 +73,17 @@ fn resolve_command_path(cmd: &str) -> String {
     }
 }
 
+fn change_dir(target: &str) -> io::Result<()> {
+    let c_target = CString::new(target)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let rc = unsafe { libc::chdir(c_target.as_ptr()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 fn spawn_external(argv: &[String]) -> io::Result<()> {
     if argv.is_empty() {
         return Ok(());
@@ -139,7 +150,7 @@ fn run_command(line: &str) -> io::Result<bool> {
         }
         "cd" => {
             let target = argv.get(1).map(String::as_str).unwrap_or("/");
-            env::set_current_dir(target)?;
+            change_dir(target)?;
             Ok(true)
         }
         _ => {
