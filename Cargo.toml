@@ -10,7 +10,7 @@ libc = { git = "https://github.com/mochiOS/libc" }
 
 [dependencies]
 libc = "0.2.185"
-mochi-user-syscall = { git = "https://github.com/mochiOS/syscalls" }
+mochi-user-syscall = { path = "../../user/crates/syscall" }
 
 [profile.dev]
 panic = "abort"
