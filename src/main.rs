@@ -579,6 +579,21 @@ fn sys_error_to_io(err: syscall::SysError) -> io::Error {
     io::Error::from_raw_os_error(err.errno().unwrap_or(syscall::EIO) as i32)
 }
 
+fn ipc_create() -> io::Result<u64> {
+    syscall::call2(syscall::SyscallNumber::IpcCreate, 0, 0).map_err(sys_error_to_io)
+}
+
+fn ipc_send(endpoint: u64, bytes: &[u8]) -> io::Result<()> {
+    syscall::call3(
+        syscall::SyscallNumber::IpcSend,
+        endpoint,
+        bytes.as_ptr() as u64,
+        bytes.len() as u64,
+    )
+    .map(|_| ())
+    .map_err(sys_error_to_io)
+}
+
 fn ipc_wait(endpoint: u64, buf: &mut [u8]) -> io::Result<u64> {
     syscall::call3(
         syscall::SyscallNumber::IpcWait,
@@ -676,8 +691,10 @@ fn parse_capability_request(buf: &[u8]) -> Option<CapabilityPromptRequest> {
 
 fn main() -> io::Result<()> {
     let _font = load_font_metrics("/system/resources/msh/ter-u12b.bdf")?;
-    let endpoint = parse_endpoint_arg()?;
+    let tty_endpoint = parse_endpoint_arg()?;
+    let endpoint = ipc_create()?;
     SHELL_ENDPOINT.store(endpoint, Ordering::Relaxed);
+    ipc_send(tty_endpoint, &endpoint.to_le_bytes())?;
     let mut line = String::new();
     let mut buf = [0u8; core::mem::size_of::<CapabilityPromptRequest>()];
     let mut prompt: Option<PendingPrompt> = None;
