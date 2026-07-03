@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use mochi_user_syscall as syscall;
 
+const WNOHANG: libc::c_int = 1;
 const EVENT_KIND_KEY: u16 = 1;
 const FLAG_PRESS: u16 = 1 << 0;
 
@@ -175,6 +176,13 @@ struct PendingPrompt {
     request: CapabilityPromptRequest,
 }
 
+#[derive(Clone, Debug, Default)]
+struct ExecutionPromptPolicy {
+    deny_prompts: bool,
+    allow_all_user: bool,
+    allow_session: Vec<String>,
+}
+
 #[derive(Clone, Copy, Default)]
 struct FontMetrics {
     width: usize,
@@ -186,8 +194,14 @@ fn load_font_metrics(path: &str) -> io::Result<FontMetrics> {
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("FONTBOUNDINGBOX ") {
             let mut parts = rest.split_whitespace();
-            let width = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(8);
-            let height = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(8);
+            let width = parts
+                .next()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(8);
+            let height = parts
+                .next()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(8);
             return Ok(FontMetrics { width, height });
         }
     }
@@ -283,7 +297,61 @@ fn change_dir(target: &str) -> io::Result<()> {
     }
 }
 
-fn spawn_external(argv: &[String]) -> io::Result<()> {
+fn parse_external_options(argv: &[String]) -> io::Result<(ExecutionPromptPolicy, &[String])> {
+    let mut policy = ExecutionPromptPolicy::default();
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--deny-prompts" => {
+                policy.deny_prompts = true;
+                index += 1;
+            }
+            "--allow-all-user" => {
+                policy.allow_all_user = true;
+                index += 1;
+            }
+            "--allow-session" => {
+                let Some(capability) = argv.get(index + 1) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--allow-session requires capability",
+                    ));
+                };
+                policy.allow_session.push(capability.clone());
+                index += 2;
+            }
+            "--" => {
+                index += 1;
+                break;
+            }
+            _ => break,
+        }
+    }
+    Ok((policy, &argv[index..]))
+}
+
+fn prompt_policy_decision(
+    policy: &ExecutionPromptPolicy,
+    request: &CapabilityPromptRequest,
+) -> Option<PromptDecision> {
+    if policy.deny_prompts {
+        return Some(PromptDecision::Deny);
+    }
+    if policy.allow_all_user && request.capability_class == CapabilityClass::UserGrantable {
+        return Some(PromptDecision::AllowAllUserGrantable);
+    }
+    let capability = request.capability();
+    if policy
+        .allow_session
+        .iter()
+        .any(|allowed| allowed.as_str() == capability)
+    {
+        return Some(PromptDecision::AllowForProcess);
+    }
+    None
+}
+
+fn spawn_external(argv: &[String], policy: &ExecutionPromptPolicy) -> io::Result<()> {
     if argv.is_empty() {
         return Ok(());
     }
@@ -311,7 +379,12 @@ fn spawn_external(argv: &[String]) -> io::Result<()> {
     let shell_endpoint_str = shell_endpoint.to_string();
     let exec_path_env = format!("MOCHI_EXECUTABLE_PATH={path}");
     let shell_endpoint_env = format!("MOCHI_SHELL_ENDPOINT={shell_endpoint_str}");
-    let prompt_mode_env = "MOCHI_PROMPT_MODE=interactive".to_string();
+    let prompt_mode = if policy.deny_prompts {
+        "deny"
+    } else {
+        "interactive"
+    };
+    let prompt_mode_env = format!("MOCHI_PROMPT_MODE={prompt_mode}");
     let env_strings = vec![
         CString::new(exec_path_env)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "env contains NUL"))?,
@@ -340,12 +413,7 @@ fn spawn_external(argv: &[String]) -> io::Result<()> {
         return Err(io::Error::from_raw_os_error(rc));
     }
 
-    let mut status = 0i32;
-    let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-    if waited != pid {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    wait_foreground_process(pid, policy)
 }
 
 fn run_command(line: &str) -> io::Result<bool> {
@@ -372,21 +440,26 @@ fn run_command(line: &str) -> io::Result<bool> {
             Ok(true)
         }
         _ => {
-            let path = resolve_command_path(&argv[0]);
+            let (policy, external_argv) = parse_external_options(&argv)?;
+            if external_argv.is_empty() {
+                println!(
+                    "usage: [--deny-prompts] [--allow-session capability] [--allow-all-user] command [args...]"
+                );
+                return Ok(true);
+            }
+            let path = resolve_command_path(&external_argv[0]);
             if fs::metadata(&path).is_err() {
                 println!("notfound");
                 return Ok(true);
             }
-            spawn_external(&argv)?;
+            spawn_external(external_argv, &policy)?;
             Ok(true)
         }
     }
 }
 
 fn handle_key_event(line: &mut String, event: InputEvent) -> io::Result<Option<String>> {
-    if event.kind != EVENT_KIND_KEY
-        || (event.flags & FLAG_PRESS) == 0
-    {
+    if event.kind != EVENT_KIND_KEY || (event.flags & FLAG_PRESS) == 0 {
         return Ok(None);
     }
 
@@ -516,6 +589,69 @@ fn ipc_wait(endpoint: u64, buf: &mut [u8]) -> io::Result<u64> {
     .map_err(sys_error_to_io)
 }
 
+fn ipc_try_wait(buf: &mut [u8]) -> io::Result<Option<u64>> {
+    match syscall::call3(
+        syscall::SyscallNumber::IpcWait,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        0,
+    ) {
+        Ok(msg) => Ok(Some(msg)),
+        Err(err) if err.errno() == Some(syscall::EAGAIN) => Ok(None),
+        Err(err) => Err(sys_error_to_io(err)),
+    }
+}
+
+fn wait_foreground_process(pid: libc::pid_t, policy: &ExecutionPromptPolicy) -> io::Result<()> {
+    let mut buf = [0u8; core::mem::size_of::<CapabilityPromptRequest>()];
+    let mut prompt: Option<PendingPrompt> = None;
+
+    loop {
+        let mut status = 0i32;
+        let waited = unsafe { libc::waitpid(pid, &mut status, WNOHANG) };
+        if waited == pid {
+            if prompt.is_some() {
+                println!();
+            }
+            return Ok(());
+        }
+        if waited < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        if let Some(msg) = ipc_try_wait(&mut buf)? {
+            let len = (msg & 0xffff_ffff) as usize;
+            if let Some(current) = prompt.as_ref().copied() {
+                if len == core::mem::size_of::<InputEvent>() {
+                    let event =
+                        unsafe { core::ptr::read_unaligned(buf.as_ptr().cast::<InputEvent>()) };
+                    if let Some(decision) = handle_prompt_key_event(&current, event)? {
+                        prompt = None;
+                        reply_prompt(&current, decision);
+                    }
+                    continue;
+                }
+            }
+
+            if let Some(request) = parse_capability_request(&buf[..len.min(buf.len())]) {
+                let current = PendingPrompt {
+                    sender: msg >> 32,
+                    request,
+                };
+                if let Some(decision) = prompt_policy_decision(policy, &current.request) {
+                    reply_prompt(&current, decision);
+                } else {
+                    print_capability_prompt(&current.request)?;
+                    prompt = Some(current);
+                }
+            }
+            continue;
+        }
+
+        let _ = syscall::call0(syscall::SyscallNumber::ThreadYield);
+    }
+}
+
 fn parse_endpoint_arg() -> io::Result<u64> {
     let mut args = env::args();
     let _program = args.next();
@@ -531,9 +667,7 @@ fn parse_capability_request(buf: &[u8]) -> Option<CapabilityPromptRequest> {
     if buf.len() < core::mem::size_of::<CapabilityPromptRequest>() {
         return None;
     }
-    let req = unsafe {
-        core::ptr::read_unaligned(buf.as_ptr().cast::<CapabilityPromptRequest>())
-    };
+    let req = unsafe { core::ptr::read_unaligned(buf.as_ptr().cast::<CapabilityPromptRequest>()) };
     if req.opcode != CAPABILITY_PROMPT_OPCODE {
         return None;
     }
@@ -554,8 +688,7 @@ fn main() -> io::Result<()> {
         let len = (msg & 0xffff_ffff) as usize;
         if prompt.is_none() {
             if len == core::mem::size_of::<InputEvent>() {
-                let event =
-                    unsafe { core::ptr::read_unaligned(buf.as_ptr().cast::<InputEvent>()) };
+                let event = unsafe { core::ptr::read_unaligned(buf.as_ptr().cast::<InputEvent>()) };
                 if let Some(command) = handle_key_event(&mut line, event)? {
                     if !run_command(&command)? {
                         break;
@@ -578,8 +711,7 @@ fn main() -> io::Result<()> {
 
         if let Some(current) = prompt.as_ref().copied() {
             if len == core::mem::size_of::<InputEvent>() {
-                let event =
-                    unsafe { core::ptr::read_unaligned(buf.as_ptr().cast::<InputEvent>()) };
+                let event = unsafe { core::ptr::read_unaligned(buf.as_ptr().cast::<InputEvent>()) };
                 if let Some(decision) = handle_prompt_key_event(&current, event)? {
                     prompt = None;
                     reply_prompt(&current, decision);
