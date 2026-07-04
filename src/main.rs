@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use mochi_user_syscall as syscall;
 
 const WNOHANG: libc::c_int = 1;
+const EAGAIN: libc::c_int = 11;
+const ECHILD: libc::c_int = 10;
 const EVENT_KIND_KEY: u16 = 1;
 const FLAG_PRESS: u16 = 1 << 0;
 
@@ -620,6 +622,7 @@ fn ipc_try_wait(buf: &mut [u8]) -> io::Result<Option<u64>> {
 fn wait_foreground_process(pid: libc::pid_t, policy: &ExecutionPromptPolicy) -> io::Result<()> {
     let mut buf = [0u8; core::mem::size_of::<CapabilityPromptRequest>()];
     let mut prompt: Option<PendingPrompt> = None;
+    let mut transient_wait_errors = 0usize;
 
     loop {
         let mut status = 0i32;
@@ -631,8 +634,21 @@ fn wait_foreground_process(pid: libc::pid_t, policy: &ExecutionPromptPolicy) -> 
             return Ok(());
         }
         if waited < 0 {
-            return Err(io::Error::last_os_error());
+            let err = io::Error::last_os_error();
+            let errno = err.raw_os_error().unwrap_or(0);
+            if errno == EAGAIN {
+                transient_wait_errors = transient_wait_errors.saturating_add(1);
+                if transient_wait_errors < 1024 {
+                    let _ = syscall::call0(syscall::SyscallNumber::ThreadYield);
+                    continue;
+                }
+            }
+            if errno == ECHILD {
+                return Ok(());
+            }
+            return Err(err);
         }
+        transient_wait_errors = 0;
 
         if let Some(msg) = ipc_try_wait(&mut buf)? {
             let len = (msg & 0xffff_ffff) as usize;
