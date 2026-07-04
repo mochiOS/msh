@@ -630,7 +630,7 @@ fn wait_foreground_process(pid: libc::pid_t, policy: &ExecutionPromptPolicy) -> 
     loop {
         let mut status = 0i32;
         let waited = unsafe { libc::waitpid(pid, &mut status, WNOHANG) };
-        if waited == pid {
+        if waited == pid || (pid == -1 && waited > 0) {
             if prompt.is_some() {
                 println!();
             }
