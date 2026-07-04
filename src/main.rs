@@ -3,14 +3,14 @@ use std::ffi::CString;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use mochi_user_syscall as syscall;
 
-const WNOHANG: libc::c_int = 1;
-const EAGAIN: libc::c_int = 11;
 const EVENT_KIND_KEY: u16 = 1;
 const FLAG_PRESS: u16 = 1 << 0;
+const EAGAIN: i32 = 11;
 
 const KEY_BACKSPACE: u16 = 2;
 const KEY_TAB: u16 = 3;
@@ -358,63 +358,21 @@ fn spawn_external(argv: &[String], policy: &ExecutionPromptPolicy) -> io::Result
     }
 
     let path = resolve_command_path(&argv[0]);
-    let c_path = CString::new(path.clone())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "command contains NUL"))?;
-
-    let mut c_strings = Vec::with_capacity(argv.len());
-    c_strings.push(c_path);
-    for arg in &argv[1..] {
-        c_strings.push(
-            CString::new(arg.as_str())
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "arg contains NUL"))?,
-        );
-    }
-
-    let mut argv_ptrs: Vec<*mut libc::c_char> = c_strings
-        .iter()
-        .map(|s| s.as_ptr() as *mut libc::c_char)
-        .collect();
-    argv_ptrs.push(core::ptr::null_mut());
-
     let shell_endpoint = SHELL_ENDPOINT.load(Ordering::Relaxed);
     let shell_endpoint_str = shell_endpoint.to_string();
-    let exec_path_env = format!("MOCHI_EXECUTABLE_PATH={path}");
-    let shell_endpoint_env = format!("MOCHI_SHELL_ENDPOINT={shell_endpoint_str}");
     let prompt_mode = if policy.deny_prompts {
         "deny"
     } else {
         "interactive"
     };
-    let prompt_mode_env = format!("MOCHI_PROMPT_MODE={prompt_mode}");
-    let env_strings = vec![
-        CString::new(exec_path_env)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "env contains NUL"))?,
-        CString::new(shell_endpoint_env)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "env contains NUL"))?,
-        CString::new(prompt_mode_env)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "env contains NUL"))?,
-    ];
-    let mut envp: Vec<*mut libc::c_char> = env_strings
-        .iter()
-        .map(|s| s.as_ptr() as *mut libc::c_char)
-        .collect();
-    envp.push(core::ptr::null_mut());
-    let mut pid: libc::pid_t = 0;
-    let rc = unsafe {
-        libc::posix_spawn(
-            &mut pid,
-            c_strings[0].as_ptr(),
-            core::ptr::null(),
-            core::ptr::null(),
-            argv_ptrs.as_mut_ptr(),
-            envp.as_mut_ptr(),
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::from_raw_os_error(rc));
-    }
 
-    wait_foreground_process(pid, policy)
+    let mut child = Command::new(&path)
+        .args(&argv[1..])
+        .env("MOCHI_EXECUTABLE_PATH", &path)
+        .env("MOCHI_SHELL_ENDPOINT", shell_endpoint_str)
+        .env("MOCHI_PROMPT_MODE", prompt_mode)
+        .spawn()?;
+    wait_foreground_process(&mut child, policy)
 }
 
 fn run_command(line: &str) -> io::Result<bool> {
@@ -448,7 +406,6 @@ fn run_command(line: &str) -> io::Result<bool> {
                 );
                 return Ok(true);
             }
-            reap_zombie_children();
             let path = resolve_command_path(&external_argv[0]);
             if fs::metadata(&path).is_err() {
                 println!("notfound");
@@ -583,25 +540,6 @@ fn sys_error_to_io(err: syscall::SysError) -> io::Error {
     io::Error::from_raw_os_error(err.errno().unwrap_or(syscall::EIO) as i32)
 }
 
-fn reap_zombie_children() {
-    loop {
-        let mut status = 0i32;
-        let waited = unsafe { libc::waitpid(-1, &mut status, WNOHANG) };
-        if waited > 0 {
-            continue;
-        }
-        if waited == 0 {
-            break;
-        }
-        let err = io::Error::last_os_error();
-        let errno = err.raw_os_error().unwrap_or(0);
-        if errno == EAGAIN {
-            continue;
-        }
-        break;
-    }
-}
-
 fn ipc_create() -> io::Result<u64> {
     syscall::call2(syscall::SyscallNumber::IpcCreate, 0, 0).map_err(sys_error_to_io)
 }
@@ -640,7 +578,7 @@ fn ipc_try_wait(buf: &mut [u8]) -> io::Result<Option<u64>> {
     }
 }
 
-fn wait_foreground_process(pid: libc::pid_t, policy: &ExecutionPromptPolicy) -> io::Result<()> {
+fn wait_foreground_process(child: &mut Child, policy: &ExecutionPromptPolicy) -> io::Result<()> {
     let mut buf = [0u8; core::mem::size_of::<CapabilityPromptRequest>()];
     let mut prompt: Option<PendingPrompt> = None;
 
@@ -673,28 +611,21 @@ fn wait_foreground_process(pid: libc::pid_t, policy: &ExecutionPromptPolicy) -> 
             }
         }
 
-        let mut status = 0i32;
-        let waited = unsafe { libc::waitpid(pid, &mut status, WNOHANG) };
-        if waited == pid || (pid == -1 && waited > 0) {
-            if prompt.is_some() {
-                println!();
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                if prompt.is_some() {
+                    println!();
+                }
+                return Ok(());
             }
-            reap_zombie_children();
-            return Ok(());
-        }
-        if waited < 0 {
-            let err = io::Error::last_os_error();
-            let errno = err.raw_os_error().unwrap_or(0);
-            if errno == EAGAIN {
+            Ok(None) => {
                 let _ = syscall::call0(syscall::SyscallNumber::ThreadYield);
-                reap_zombie_children();
-                continue;
             }
-            return Err(err);
+            Err(error) if error.raw_os_error() == Some(EAGAIN) => {
+                let _ = syscall::call0(syscall::SyscallNumber::ThreadYield);
+            }
+            Err(error) => return Err(error),
         }
-
-        let _ = syscall::call0(syscall::SyscallNumber::ThreadYield);
-        reap_zombie_children();
     }
 }
 
