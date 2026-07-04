@@ -412,6 +412,9 @@ fn spawn_external(argv: &[String], policy: &ExecutionPromptPolicy) -> io::Result
         )
     };
     if rc != 0 {
+        if rc == EAGAIN {
+            return wait_foreground_process(-1, policy);
+        }
         return Err(io::Error::from_raw_os_error(rc));
     }
 
@@ -643,7 +646,7 @@ fn wait_foreground_process(pid: libc::pid_t, policy: &ExecutionPromptPolicy) -> 
                     continue;
                 }
             }
-            if errno == ECHILD {
+            if errno == ECHILD && pid != -1 {
                 return Ok(());
             }
             return Err(err);
