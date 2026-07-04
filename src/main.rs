@@ -9,7 +9,6 @@ use mochi_user_syscall as syscall;
 
 const WNOHANG: libc::c_int = 1;
 const EAGAIN: libc::c_int = 11;
-const ECHILD: libc::c_int = 10;
 const EVENT_KIND_KEY: u16 = 1;
 const FLAG_PRESS: u16 = 1 << 0;
 
@@ -412,110 +411,10 @@ fn spawn_external(argv: &[String], policy: &ExecutionPromptPolicy) -> io::Result
         )
     };
     if rc != 0 {
-        if is_transient_spawn_error(rc) {
-            // Keep the interactive shell alive on transient spawn pressure and
-            // make a best-effort reap so a concurrently-created child is not left.
-            wait_spawned_command_by_name(&path, policy)?;
-            return Ok(());
-        }
         return Err(io::Error::from_raw_os_error(rc));
     }
 
     wait_foreground_process(pid, policy)
-}
-
-fn process_name_for_path(path: &str) -> &str {
-    path.rsplit('/').next().filter(|name| !name.is_empty()).unwrap_or(path)
-}
-
-fn find_process_thread_by_name(name: &str) -> Option<u64> {
-    if name.is_empty() || name.len() > 64 {
-        return None;
-    }
-    syscall::call2(
-        syscall::SyscallNumber::FindProcessByName,
-        name.as_ptr() as u64,
-        name.len() as u64,
-    )
-    .ok()
-    .filter(|id| *id != 0)
-}
-
-fn wait_spawned_command_by_name(path: &str, policy: &ExecutionPromptPolicy) -> io::Result<()> {
-    const APPEAR_RETRY_LIMIT: usize = 8192;
-    const DISAPPEAR_RETRY_LIMIT: usize = 1_000_000;
-
-    let name = process_name_for_path(path);
-    let mut observed = false;
-    let mut missing_checks = 0usize;
-    let mut disappear_checks = 0usize;
-
-    loop {
-        if let Some(thread_or_pid) = find_process_thread_by_name(name) {
-            observed = true;
-            disappear_checks = 0;
-            let wait_pid = thread_or_pid as libc::pid_t;
-            let mut status = 0i32;
-            let waited = unsafe { libc::waitpid(wait_pid, &mut status, WNOHANG) };
-            if waited == wait_pid {
-                return Ok(());
-            }
-            if waited < 0 {
-                let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                if errno != ECHILD && errno != EAGAIN {
-                    return Err(io::Error::last_os_error());
-                }
-            }
-            let _ = drain_prompt_messages(policy)?;
-            let _ = syscall::call0(syscall::SyscallNumber::ThreadYield);
-            continue;
-        }
-
-        if observed {
-            disappear_checks = disappear_checks.saturating_add(1);
-            if disappear_checks >= DISAPPEAR_RETRY_LIMIT {
-                return Ok(());
-            }
-        } else {
-            missing_checks = missing_checks.saturating_add(1);
-            if missing_checks >= APPEAR_RETRY_LIMIT {
-                let _ = wait_foreground_process(-1, policy);
-                return Ok(());
-            }
-        }
-        let _ = drain_prompt_messages(policy)?;
-        let _ = syscall::call0(syscall::SyscallNumber::ThreadYield);
-    }
-}
-
-fn drain_prompt_messages(policy: &ExecutionPromptPolicy) -> io::Result<bool> {
-    let mut buf = [0u8; core::mem::size_of::<CapabilityPromptRequest>()];
-    let mut handled = false;
-    while let Some(msg) = ipc_try_wait(&mut buf)? {
-        let len = (msg & 0xffff_ffff) as usize;
-        if let Some(request) = parse_capability_request(&buf[..len.min(buf.len())]) {
-            let current = PendingPrompt {
-                sender: msg >> 32,
-                request,
-            };
-            if let Some(decision) = prompt_policy_decision(policy, &current.request) {
-                reply_prompt(&current, decision);
-            } else {
-                print_capability_prompt(&current.request)?;
-                reply_prompt(&current, PromptDecision::Deny);
-                println!();
-            }
-            handled = true;
-        }
-    }
-    Ok(handled)
-}
-
-fn is_transient_spawn_error(rc: libc::c_int) -> bool {
-    if rc == EAGAIN || rc == -EAGAIN {
-        return true;
-    }
-    rc == -1 && io::Error::last_os_error().raw_os_error() == Some(EAGAIN)
 }
 
 fn run_command(line: &str) -> io::Result<bool> {
@@ -549,6 +448,7 @@ fn run_command(line: &str) -> io::Result<bool> {
                 );
                 return Ok(true);
             }
+            reap_zombie_children();
             let path = resolve_command_path(&external_argv[0]);
             if fs::metadata(&path).is_err() {
                 println!("notfound");
@@ -683,6 +583,25 @@ fn sys_error_to_io(err: syscall::SysError) -> io::Error {
     io::Error::from_raw_os_error(err.errno().unwrap_or(syscall::EIO) as i32)
 }
 
+fn reap_zombie_children() {
+    loop {
+        let mut status = 0i32;
+        let waited = unsafe { libc::waitpid(-1, &mut status, WNOHANG) };
+        if waited > 0 {
+            continue;
+        }
+        if waited == 0 {
+            break;
+        }
+        let err = io::Error::last_os_error();
+        let errno = err.raw_os_error().unwrap_or(0);
+        if errno == EAGAIN {
+            continue;
+        }
+        break;
+    }
+}
+
 fn ipc_create() -> io::Result<u64> {
     syscall::call2(syscall::SyscallNumber::IpcCreate, 0, 0).map_err(sys_error_to_io)
 }
@@ -722,51 +641,10 @@ fn ipc_try_wait(buf: &mut [u8]) -> io::Result<Option<u64>> {
 }
 
 fn wait_foreground_process(pid: libc::pid_t, policy: &ExecutionPromptPolicy) -> io::Result<()> {
-    const MISSING_CHILD_RETRY_LIMIT: usize = 8192;
-
     let mut buf = [0u8; core::mem::size_of::<CapabilityPromptRequest>()];
     let mut prompt: Option<PendingPrompt> = None;
-    let mut transient_wait_errors = 0usize;
-    let mut missing_child_checks = 0usize;
 
     loop {
-        let mut status = 0i32;
-        let waited = unsafe { libc::waitpid(pid, &mut status, WNOHANG) };
-        if waited == pid || (pid == -1 && waited > 0) {
-            if prompt.is_some() {
-                println!();
-            }
-            return Ok(());
-        }
-        if waited < 0 {
-            let err = io::Error::last_os_error();
-            let errno = err.raw_os_error().unwrap_or(0);
-            if errno == EAGAIN {
-                transient_wait_errors = transient_wait_errors.saturating_add(1);
-                if transient_wait_errors < 1024 {
-                    let _ = syscall::call0(syscall::SyscallNumber::ThreadYield);
-                    continue;
-                }
-                if pid == -1 {
-                    return Ok(());
-                }
-            }
-            if errno == ECHILD && pid == -1 {
-                missing_child_checks = missing_child_checks.saturating_add(1);
-                if missing_child_checks < MISSING_CHILD_RETRY_LIMIT {
-                    let _ = syscall::call0(syscall::SyscallNumber::ThreadYield);
-                    continue;
-                }
-                return Ok(());
-            }
-            if errno == ECHILD && pid != -1 {
-                return Ok(());
-            }
-            return Err(err);
-        }
-        transient_wait_errors = 0;
-        missing_child_checks = 0;
-
         if let Some(msg) = ipc_try_wait(&mut buf)? {
             let len = (msg & 0xffff_ffff) as usize;
             if let Some(current) = prompt.as_ref().copied() {
@@ -793,10 +671,30 @@ fn wait_foreground_process(pid: libc::pid_t, policy: &ExecutionPromptPolicy) -> 
                     prompt = Some(current);
                 }
             }
-            continue;
+        }
+
+        let mut status = 0i32;
+        let waited = unsafe { libc::waitpid(pid, &mut status, WNOHANG) };
+        if waited == pid || (pid == -1 && waited > 0) {
+            if prompt.is_some() {
+                println!();
+            }
+            reap_zombie_children();
+            return Ok(());
+        }
+        if waited < 0 {
+            let err = io::Error::last_os_error();
+            let errno = err.raw_os_error().unwrap_or(0);
+            if errno == EAGAIN {
+                let _ = syscall::call0(syscall::SyscallNumber::ThreadYield);
+                reap_zombie_children();
+                continue;
+            }
+            return Err(err);
         }
 
         let _ = syscall::call0(syscall::SyscallNumber::ThreadYield);
+        reap_zombie_children();
     }
 }
 
