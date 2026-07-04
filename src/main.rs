@@ -645,6 +645,12 @@ fn wait_foreground_process(pid: libc::pid_t, policy: &ExecutionPromptPolicy) -> 
                     let _ = syscall::call0(syscall::SyscallNumber::ThreadYield);
                     continue;
                 }
+                if pid == -1 {
+                    return Ok(());
+                }
+            }
+            if errno == ECHILD && pid == -1 {
+                return Ok(());
             }
             if errno == ECHILD && pid != -1 {
                 return Ok(());
