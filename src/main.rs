@@ -3,7 +3,6 @@ use std::ffi::CString;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use mochi_user_syscall as syscall;
@@ -358,21 +357,8 @@ fn spawn_external(argv: &[String], policy: &ExecutionPromptPolicy) -> io::Result
     }
 
     let path = resolve_command_path(&argv[0]);
-    let shell_endpoint = SHELL_ENDPOINT.load(Ordering::Relaxed);
-    let shell_endpoint_str = shell_endpoint.to_string();
-    let prompt_mode = if policy.deny_prompts {
-        "deny"
-    } else {
-        "interactive"
-    };
-
-    let mut child = Command::new(&path)
-        .args(&argv[1..])
-        .env("MOCHI_EXECUTABLE_PATH", &path)
-        .env("MOCHI_SHELL_ENDPOINT", shell_endpoint_str)
-        .env("MOCHI_PROMPT_MODE", prompt_mode)
-        .spawn()?;
-    wait_foreground_process(&mut child, policy)
+    let child_pid = spawn_program(&path, argv, policy)?;
+    wait_foreground_process(child_pid, policy)
 }
 
 fn run_command(line: &str) -> io::Result<bool> {
@@ -578,7 +564,7 @@ fn ipc_try_wait(buf: &mut [u8]) -> io::Result<Option<u64>> {
     }
 }
 
-fn wait_foreground_process(child: &mut Child, policy: &ExecutionPromptPolicy) -> io::Result<()> {
+fn wait_foreground_process(child_pid: libc::pid_t, policy: &ExecutionPromptPolicy) -> io::Result<()> {
     let mut buf = [0u8; core::mem::size_of::<CapabilityPromptRequest>()];
     let mut prompt: Option<PendingPrompt> = None;
 
@@ -611,22 +597,101 @@ fn wait_foreground_process(child: &mut Child, policy: &ExecutionPromptPolicy) ->
             }
         }
 
-        match child.try_wait() {
-            Ok(Some(_status)) => {
+        match waitpid_nonblocking(child_pid)? {
+            Some(_status) => {
                 if prompt.is_some() {
                     println!();
                 }
                 return Ok(());
             }
-            Ok(None) => {
+            None => {
                 let _ = syscall::call0(syscall::SyscallNumber::ThreadYield);
             }
-            Err(error) if error.raw_os_error() == Some(EAGAIN) => {
-                let _ = syscall::call0(syscall::SyscallNumber::ThreadYield);
-            }
-            Err(error) => return Err(error),
         }
     }
+}
+
+fn spawn_program(
+    command_path: &str,
+    argv: &[String],
+    policy: &ExecutionPromptPolicy,
+) -> io::Result<libc::pid_t> {
+    let path = CString::new(command_path)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid command path"))?;
+
+    let mut argv_storage = Vec::with_capacity(argv.len() + 1);
+    for arg in argv {
+        argv_storage.push(
+            CString::new(arg.as_str())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid argument"))?,
+        );
+    }
+    let mut argv_ptrs: Vec<*mut libc::c_char> = argv_storage
+        .iter_mut()
+        .map(|arg| arg.as_ptr() as *mut libc::c_char)
+        .collect();
+    argv_ptrs.push(std::ptr::null_mut());
+
+    let shell_endpoint = SHELL_ENDPOINT.load(Ordering::Relaxed).to_string();
+    let prompt_mode = if policy.deny_prompts { "deny" } else { "interactive" };
+    let mut env_storage = Vec::new();
+    for (key, value) in env::vars() {
+        if matches!(
+            key.as_str(),
+            "MOCHI_EXECUTABLE_PATH" | "MOCHI_SHELL_ENDPOINT" | "MOCHI_PROMPT_MODE"
+        ) {
+            continue;
+        }
+        env_storage.push(
+            CString::new(format!("{key}={value}"))
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid environment"))?,
+        );
+    }
+    env_storage.push(
+        CString::new(format!("MOCHI_EXECUTABLE_PATH={command_path}"))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid environment"))?,
+    );
+    env_storage.push(
+        CString::new(format!("MOCHI_SHELL_ENDPOINT={shell_endpoint}"))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid environment"))?,
+    );
+    env_storage.push(
+        CString::new(format!("MOCHI_PROMPT_MODE={prompt_mode}"))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid environment"))?,
+    );
+    let mut env_ptrs: Vec<*mut libc::c_char> = env_storage
+        .iter_mut()
+        .map(|entry| entry.as_ptr() as *mut libc::c_char)
+        .collect();
+    env_ptrs.push(std::ptr::null_mut());
+
+    let mut child_pid: libc::pid_t = -1;
+    let rc = unsafe {
+        libc::posix_spawn(
+            &mut child_pid,
+            path.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            argv_ptrs.as_ptr(),
+            env_ptrs.as_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc));
+    }
+    Ok(child_pid)
+}
+
+fn waitpid_nonblocking(pid: libc::pid_t) -> io::Result<Option<i32>> {
+    let mut status = 0i32;
+    let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if rc == 0 {
+        return Ok(None);
+    }
+    Ok(Some(status))
 }
 
 fn parse_endpoint_arg() -> io::Result<u64> {
