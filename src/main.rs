@@ -572,7 +572,7 @@ fn authorize_prompt_decision(
     let request = CapabilityDecisionRequest {
         opcode: CAPABILITY_DECISION_OPCODE,
         decision: capability_decision(decision),
-        reserved: prompt.sender,
+        reserved: prompt.request.process_id,
         request: prompt.request,
     };
     let mut reply = [0u8; 8];
