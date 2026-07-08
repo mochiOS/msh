@@ -370,7 +370,7 @@ fn spawn_external(argv: &[String], policy: &ExecutionPromptPolicy) -> io::Result
 
     let path = resolve_command_path(&argv[0]);
     let shell_endpoint = SHELL_ENDPOINT.load(Ordering::Relaxed);
-    let shell_endpoint_str = shell_endpoint.to_string();
+    let shell_target_str = current_thread_id()?.to_string();
     let prompt_mode = if policy.deny_prompts {
         "deny"
     } else {
@@ -379,19 +379,21 @@ fn spawn_external(argv: &[String], policy: &ExecutionPromptPolicy) -> io::Result
 
     if policy.background {
         eprintln!("msh: background launch path for {}", argv[0]);
-        spawn_background_external_direct(&path, &shell_endpoint_str, prompt_mode)?;
+        spawn_background_external_direct(&path, &shell_target_str, prompt_mode)?;
         return wait_background_capability_request(shell_endpoint, policy);
     }
 
     let child_result = Command::new(&path)
         .args(&argv[1..])
         .env("MOCHI_EXECUTABLE_PATH", &path)
-        .env("MOCHI_SHELL_ENDPOINT", shell_endpoint_str)
+        .env("MOCHI_SHELL_ENDPOINT", shell_target_str)
         .env("MOCHI_PROMPT_MODE", prompt_mode)
         .spawn();
     let mut child = match child_result {
         Ok(child) => child,
-        Err(_) if policy.background => return wait_background_capability_request(shell_endpoint, policy),
+        Err(_) if policy.background => {
+            return wait_background_capability_request(shell_endpoint, policy);
+        }
         Err(error) => return Err(error),
     };
     wait_foreground_process(&mut child, policy)
@@ -602,6 +604,10 @@ fn sys_error_to_io(err: syscall::SysError) -> io::Error {
 
 fn ipc_create() -> io::Result<u64> {
     syscall::call2(syscall::SyscallNumber::IpcCreate, 0, 0).map_err(sys_error_to_io)
+}
+
+fn current_thread_id() -> io::Result<u64> {
+    syscall::call0(syscall::SyscallNumber::GetTid).map_err(sys_error_to_io)
 }
 
 fn ipc_send(endpoint: u64, bytes: &[u8]) -> io::Result<()> {
