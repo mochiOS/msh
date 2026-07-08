@@ -181,6 +181,7 @@ struct PendingPrompt {
 struct ExecutionPromptPolicy {
     deny_prompts: bool,
     allow_all_user: bool,
+    background: bool,
     allow_session: Vec<String>,
 }
 
@@ -311,6 +312,10 @@ fn parse_external_options(argv: &[String]) -> io::Result<(ExecutionPromptPolicy,
                 policy.allow_all_user = true;
                 index += 1;
             }
+            "--background" => {
+                policy.background = true;
+                index += 1;
+            }
             "--allow-session" => {
                 let Some(capability) = argv.get(index + 1) else {
                     return Err(io::Error::new(
@@ -356,6 +361,12 @@ fn spawn_external(argv: &[String], policy: &ExecutionPromptPolicy) -> io::Result
     if argv.is_empty() {
         return Ok(());
     }
+    if policy.background && policy.allow_session.is_empty() && !policy.allow_all_user {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "--background requires --allow-session or --allow-all-user",
+        ));
+    }
 
     let path = resolve_command_path(&argv[0]);
     let shell_endpoint = SHELL_ENDPOINT.load(Ordering::Relaxed);
@@ -366,13 +377,62 @@ fn spawn_external(argv: &[String], policy: &ExecutionPromptPolicy) -> io::Result
         "interactive"
     };
 
-    let mut child = Command::new(&path)
+    if policy.background {
+        eprintln!("msh: background launch path for {}", argv[0]);
+        spawn_background_external_direct(&path, &shell_endpoint_str, prompt_mode)?;
+        return wait_background_capability_request(shell_endpoint, policy);
+    }
+
+    let child_result = Command::new(&path)
         .args(&argv[1..])
         .env("MOCHI_EXECUTABLE_PATH", &path)
         .env("MOCHI_SHELL_ENDPOINT", shell_endpoint_str)
         .env("MOCHI_PROMPT_MODE", prompt_mode)
-        .spawn()?;
+        .spawn();
+    let mut child = match child_result {
+        Ok(child) => child,
+        Err(_) if policy.background => return wait_background_capability_request(shell_endpoint, policy),
+        Err(error) => return Err(error),
+    };
     wait_foreground_process(&mut child, policy)
+}
+
+fn spawn_background_external_direct(
+    path: &str,
+    shell_endpoint: &str,
+    prompt_mode: &str,
+) -> io::Result<()> {
+    let c_path = CString::new(path)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid executable path"))?;
+    let env_exe = CString::new(format!("MOCHI_EXECUTABLE_PATH={path}"))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid executable path"))?;
+    let env_shell = CString::new(format!("MOCHI_SHELL_ENDPOINT={shell_endpoint}"))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid shell endpoint"))?;
+    let env_prompt = CString::new(format!("MOCHI_PROMPT_MODE={prompt_mode}"))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid prompt mode"))?;
+
+    eprintln!("msh: fork exec {}", path);
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        let error = io::Error::last_os_error();
+        eprintln!("msh: fork failed: {error}");
+        return Err(error);
+    }
+    if pid == 0 {
+        let argv = [c_path.as_ptr(), core::ptr::null()];
+        let envp = [
+            env_exe.as_ptr(),
+            env_shell.as_ptr(),
+            env_prompt.as_ptr(),
+            core::ptr::null(),
+        ];
+        unsafe {
+            libc::execve(c_path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            libc::_exit(127);
+        }
+    }
+    eprintln!("msh: forked child pid={pid}");
+    Ok(())
 }
 
 fn run_command(line: &str) -> io::Result<bool> {
@@ -402,7 +462,7 @@ fn run_command(line: &str) -> io::Result<bool> {
             let (policy, external_argv) = parse_external_options(&argv)?;
             if external_argv.is_empty() {
                 println!(
-                    "usage: [--deny-prompts] [--allow-session capability] [--allow-all-user] command [args...]"
+                    "usage: [--deny-prompts] [--allow-session capability] [--allow-all-user] [--background] command [args...]"
                 );
                 return Ok(true);
             }
@@ -604,6 +664,9 @@ fn wait_foreground_process(child: &mut Child, policy: &ExecutionPromptPolicy) ->
                 };
                 if let Some(decision) = prompt_policy_decision(policy, &current.request) {
                     reply_prompt(&current, decision);
+                    if policy.background {
+                        return Ok(());
+                    }
                 } else {
                     print_capability_prompt(&current.request)?;
                     prompt = Some(current);
@@ -621,12 +684,50 @@ fn wait_foreground_process(child: &mut Child, policy: &ExecutionPromptPolicy) ->
             Ok(None) => {
                 let _ = syscall::call0(syscall::SyscallNumber::ThreadYield);
             }
-            Err(error) if error.raw_os_error() == Some(EAGAIN) => {
+            Err(error)
+                if policy.background
+                    || error.raw_os_error() == Some(EAGAIN)
+                    || error.kind() == io::ErrorKind::WouldBlock =>
+            {
                 let _ = syscall::call0(syscall::SyscallNumber::ThreadYield);
             }
             Err(error) => return Err(error),
         }
     }
+}
+
+fn wait_background_capability_request(
+    endpoint: u64,
+    policy: &ExecutionPromptPolicy,
+) -> io::Result<()> {
+    let mut buf = [0u8; core::mem::size_of::<CapabilityPromptRequest>()];
+    for _ in 0..65_536 {
+        let msg = match ipc_wait(endpoint, &mut buf) {
+            Ok(msg) => msg,
+            Err(error) if error.raw_os_error() == Some(EAGAIN) => {
+                let _ = syscall::call0(syscall::SyscallNumber::ThreadYield);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let len = (msg & 0xffff_ffff) as usize;
+        if let Some(request) = parse_capability_request(&buf[..len.min(buf.len())]) {
+            let current = PendingPrompt {
+                sender: msg >> 32,
+                request,
+            };
+            if let Some(decision) = prompt_policy_decision(policy, &current.request) {
+                reply_prompt(&current, decision);
+                return Ok(());
+            }
+            print_capability_prompt(&current.request)?;
+            return Ok(());
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "background command did not request a session capability",
+    ))
 }
 
 fn parse_endpoint_arg() -> io::Result<u64> {
