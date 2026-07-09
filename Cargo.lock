@@ -9,6 +9,8 @@ version = "0.2.185"
 [[package]]
 name = "mnu-abi"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "522a13d1239f1c600ea0cb0c871d48a98986ba36d5802417fe37c177a1245324"
 
 [[package]]
 name = "mochi-user-syscall"
