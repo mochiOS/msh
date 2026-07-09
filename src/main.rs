@@ -289,83 +289,7 @@ fn resolve_command_path(cmd: &str) -> io::Result<String> {
         return Ok(format!("/bin/{cmd}"));
     };
 
-    if path.extension().and_then(|extension| extension.to_str()) == Some("app") {
-        return resolve_app_bundle_path(&path);
-    }
-
     Ok(path.to_string_lossy().into_owned())
-}
-
-fn resolve_app_bundle_path(app_root: &std::path::Path) -> io::Result<String> {
-    let manifest_path = app_root.join("manifest.toml");
-    let about_path = app_root.join("about.toml");
-
-    if !manifest_path.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "app manifest.toml not found",
-        ));
-    }
-
-    let manifest = fs::read_to_string(manifest_path)?;
-    let about = fs::read_to_string(about_path)?;
-    let entry = parse_toml_string_field(&about, "entry")
-        .or_else(|| parse_toml_string_field(&manifest, "path"))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "app entry not found"))?;
-    let entry_path = PathBuf::from(entry);
-
-    let executable = if entry_path.is_absolute() {
-        entry_path
-    } else {
-        app_root.join(entry_path)
-    };
-
-    Ok(executable.to_string_lossy().into_owned())
-}
-
-fn parse_toml_string_field(content: &str, key: &str) -> Option<String> {
-    for line in content.lines() {
-        let line = line.trim();
-        let Some((field, value)) = line.split_once('=') else {
-            continue;
-        };
-        if field.trim() != key {
-            continue;
-        }
-        return parse_toml_string_literal(value);
-    }
-    None
-}
-
-fn parse_toml_string_literal(value: &str) -> Option<String> {
-    let value = value.trim();
-    if !value.starts_with('"') {
-        return None;
-    }
-
-    let mut output = String::new();
-    let mut escaped = false;
-
-    for character in value[1..].chars() {
-        if escaped {
-            output.push(match character {
-                'n' => '\n',
-                'r' => '\r',
-                't' => '\t',
-                other => other,
-            });
-            escaped = false;
-            continue;
-        }
-
-        match character {
-            '\\' => escaped = true,
-            '"' => return Some(output),
-            other => output.push(other),
-        }
-    }
-
-    None
 }
 
 fn change_dir(target: &str) -> io::Result<()> {
@@ -555,7 +479,7 @@ fn run_command(line: &str) -> io::Result<bool> {
                     return Ok(true);
                 }
             };
-            if fs::metadata(&path).is_err() {
+            if !path.ends_with(".app") && fs::metadata(&path).is_err() {
                 println!("notfound");
                 return Ok(true);
             }
