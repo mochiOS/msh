@@ -1,8 +1,8 @@
 use std::env;
 use std::ffi::CString;
 use std::fs;
-use std::io::{self, Write};
-use std::path::PathBuf;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -11,6 +11,7 @@ use mochi_user_syscall as syscall;
 const EVENT_KIND_KEY: u16 = 1;
 const FLAG_PRESS: u16 = 1 << 0;
 const EAGAIN: i32 = 11;
+const EAGAIN_U64: u64 = 11;
 
 const KEY_BACKSPACE: u16 = 2;
 const KEY_TAB: u16 = 3;
@@ -18,6 +19,7 @@ const KEY_ENTER: u16 = 4;
 const KEY_ESCAPE: u16 = 1;
 const CAPABILITY_DECISION_OPCODE: u32 = 0x4350_5244;
 const CAPABILITY_SERVICE_NAME: &str = "capability.service";
+const MAX_APP_METADATA_BYTES: usize = 64 * 1024;
 
 static SHELL_ENDPOINT: AtomicU64 = AtomicU64::new(0);
 
@@ -282,14 +284,108 @@ fn redraw_line(line: &str) -> io::Result<()> {
 
 fn resolve_command_path(cmd: &str) -> io::Result<String> {
     let path = if cmd.contains('/') {
-        PathBuf::from(cmd)
+        let path = PathBuf::from(cmd);
+        if cmd.ends_with(".app") {
+            resolve_app_entry(&path)?
+        } else {
+            path
+        }
     } else if cmd.ends_with(".app") {
-        PathBuf::from("/applications").join(cmd)
+        resolve_app_entry(&PathBuf::from("/applications").join(cmd))?
     } else {
         return Ok(format!("/bin/{cmd}"));
     };
 
     Ok(path.to_string_lossy().into_owned())
+}
+
+fn resolve_app_entry(app_root: &Path) -> io::Result<PathBuf> {
+    let about_path = app_root.join("about.toml");
+    let manifest_path = app_root.join("manifest.toml");
+    let about = read_text_file_bounded(&about_path, MAX_APP_METADATA_BYTES).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{}: app about.toml not found", app_root.display()),
+        )
+    })?;
+    let manifest =
+        read_text_file_bounded(&manifest_path, MAX_APP_METADATA_BYTES).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{}: app manifest.toml not found", app_root.display()),
+            )
+        })?;
+
+    let entry = parse_toml_string_field(&about, "entry")
+        .or_else(|| parse_toml_string_field(&manifest, "path"))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: app entry not found", app_root.display()),
+            )
+        })?;
+
+    let entry_path = PathBuf::from(entry);
+    if entry_path.is_absolute() {
+        Ok(entry_path)
+    } else {
+        Ok(app_root.join(entry_path))
+    }
+}
+
+fn read_text_file_bounded(path: &Path, max_bytes: usize) -> io::Result<String> {
+    let file = fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}: app metadata too large", path.display()),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}: invalid utf-8", path.display()),
+        )
+    })
+}
+
+fn parse_toml_string_field(content: &str, key: &str) -> Option<String> {
+    for line in content.lines() {
+        let Some((field, value)) = line.trim().split_once('=') else {
+            continue;
+        };
+        if field.trim() != key {
+            continue;
+        }
+        return parse_toml_string_literal(value);
+    }
+    None
+}
+
+fn parse_toml_string_literal(value: &str) -> Option<String> {
+    let value = value.trim();
+    if !value.starts_with('"') {
+        return None;
+    }
+    let mut output = String::new();
+    let mut chars = value[1..].chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => return Some(output),
+            '\\' => match chars.next()? {
+                '"' => output.push('"'),
+                '\\' => output.push('\\'),
+                'n' => output.push('\n'),
+                'r' => output.push('\r'),
+                't' => output.push('\t'),
+                other => output.push(other),
+            },
+            other => output.push(other),
+        }
+    }
+    None
 }
 
 fn change_dir(target: &str) -> io::Result<()> {
@@ -372,6 +468,7 @@ fn spawn_external(argv: &[String], policy: &ExecutionPromptPolicy) -> io::Result
         ));
     }
 
+    let is_app_bundle = argv[0].ends_with(".app");
     let path = resolve_command_path(&argv[0])?;
     let shell_endpoint = SHELL_ENDPOINT.load(Ordering::Relaxed);
     let shell_target_str = current_thread_id()?.to_string();
@@ -383,33 +480,40 @@ fn spawn_external(argv: &[String], policy: &ExecutionPromptPolicy) -> io::Result
 
     if policy.background {
         eprintln!("msh: background launch path for {}", argv[0]);
-        spawn_background_external_direct(&path, &shell_target_str, prompt_mode)?;
+        spawn_external_direct(&path, &argv[1..], &shell_target_str, prompt_mode)?;
         return wait_background_capability_request(shell_endpoint, policy);
     }
 
-    let child_result = Command::new(&path)
+    if is_app_bundle {
+        let pid = spawn_external_direct(&path, &argv[1..], &shell_target_str, prompt_mode)?;
+        return wait_foreground_pid(pid, policy);
+    }
+
+    let mut child = Command::new(&path)
         .args(&argv[1..])
         .env("MOCHI_EXECUTABLE_PATH", &path)
         .env("MOCHI_SHELL_ENDPOINT", shell_target_str)
         .env("MOCHI_PROMPT_MODE", prompt_mode)
-        .spawn();
-    let mut child = match child_result {
-        Ok(child) => child,
-        Err(_) if policy.background => {
-            return wait_background_capability_request(shell_endpoint, policy);
-        }
-        Err(error) => return Err(error),
-    };
-    wait_foreground_process(&mut child, policy)
+        .spawn()?;
+    wait_foreground_child(&mut child, policy)
 }
 
-fn spawn_background_external_direct(
+fn spawn_external_direct(
     path: &str,
+    args: &[String],
     shell_endpoint: &str,
     prompt_mode: &str,
-) -> io::Result<()> {
+) -> io::Result<i32> {
     let c_path = CString::new(path)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid executable path"))?;
+    let mut c_args = Vec::with_capacity(args.len() + 1);
+    c_args.push(c_path.clone());
+    for arg in args {
+        c_args.push(
+            CString::new(arg.as_str())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid argument"))?,
+        );
+    }
     let env_exe = CString::new(format!("MOCHI_EXECUTABLE_PATH={path}"))
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid executable path"))?;
     let env_shell = CString::new(format!("MOCHI_SHELL_ENDPOINT={shell_endpoint}"))
@@ -425,20 +529,64 @@ fn spawn_background_external_direct(
         return Err(error);
     }
     if pid == 0 {
-        let argv = [c_path.as_ptr(), core::ptr::null()];
+        let mut argv: Vec<*const i8> = c_args.iter().map(|arg| arg.as_ptr()).collect();
+        argv.push(core::ptr::null());
+        let exec_path_ptr = argv[0];
         let envp = [
             env_exe.as_ptr(),
             env_shell.as_ptr(),
             env_prompt.as_ptr(),
             core::ptr::null(),
         ];
+        let argv_ptr = argv.as_ptr();
+        let envp_ptr = envp.as_ptr();
         unsafe {
-            libc::execve(c_path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            let result = syscall::raw_syscall3(
+                syscall::SyscallNumber::Execve,
+                exec_path_ptr as u64,
+                argv_ptr as u64,
+                envp_ptr as u64,
+            );
+            write_execve_failed_result(result.raw() as i64);
             libc::_exit(127);
         }
     }
     eprintln!("msh: forked child pid={pid}");
-    Ok(())
+    Ok(pid)
+}
+
+unsafe fn write_execve_failed_result(result: i64) {
+    let errno = if result < 0 {
+        result.saturating_neg() as u32
+    } else {
+        result as u32
+    };
+    let mut buf = [0u8; 48];
+    let prefix = b"msh: execve failed errno=";
+    let mut len = prefix.len();
+    buf[..prefix.len()].copy_from_slice(prefix);
+
+    if errno == 0 {
+        buf[len] = b'0';
+        len += 1;
+    } else {
+        let mut value = errno;
+        let mut digits = [0u8; 10];
+        let mut digit_len = 0usize;
+        while value != 0 && digit_len < digits.len() {
+            digits[digit_len] = b'0' + (value % 10) as u8;
+            value /= 10;
+            digit_len += 1;
+        }
+        while digit_len != 0 {
+            digit_len -= 1;
+            buf[len] = digits[digit_len];
+            len += 1;
+        }
+    }
+    buf[len] = b'\n';
+    len += 1;
+    let _ = unsafe { libc::write(2, buf.as_ptr().cast(), len) };
 }
 
 fn run_command(line: &str) -> io::Result<bool> {
@@ -649,12 +797,12 @@ fn ipc_try_wait(buf: &mut [u8]) -> io::Result<Option<u64>> {
         0,
     ) {
         Ok(msg) => Ok(Some(msg)),
-        Err(err) if err.errno() == Some(syscall::EAGAIN) => Ok(None),
+        Err(err) if err.errno() == Some(EAGAIN_U64) => Ok(None),
         Err(err) => Err(sys_error_to_io(err)),
     }
 }
 
-fn wait_foreground_process(child: &mut Child, policy: &ExecutionPromptPolicy) -> io::Result<()> {
+fn wait_foreground_child(child: &mut Child, policy: &ExecutionPromptPolicy) -> io::Result<()> {
     let mut buf = [0u8; core::mem::size_of::<CapabilityPromptRequest>()];
     let mut prompt: Option<PendingPrompt> = None;
 
@@ -708,6 +856,63 @@ fn wait_foreground_process(child: &mut Child, policy: &ExecutionPromptPolicy) ->
                 let _ = syscall::call0(syscall::SyscallNumber::ThreadYield);
             }
             Err(error) => return Err(error),
+        }
+    }
+}
+
+fn wait_foreground_pid(pid: i32, policy: &ExecutionPromptPolicy) -> io::Result<()> {
+    let mut buf = [0u8; core::mem::size_of::<CapabilityPromptRequest>()];
+    let mut prompt: Option<PendingPrompt> = None;
+
+    loop {
+        if let Some(msg) = ipc_try_wait(&mut buf)? {
+            let len = (msg & 0xffff_ffff) as usize;
+            if let Some(current) = prompt.as_ref().copied() {
+                if len == core::mem::size_of::<InputEvent>() {
+                    let event =
+                        unsafe { core::ptr::read_unaligned(buf.as_ptr().cast::<InputEvent>()) };
+                    if let Some(decision) = handle_prompt_key_event(&current, event)? {
+                        prompt = None;
+                        reply_prompt(&current, decision);
+                    }
+                    continue;
+                }
+            }
+
+            if let Some(request) = parse_capability_request(&buf[..len.min(buf.len())]) {
+                let current = PendingPrompt {
+                    sender: msg >> 32,
+                    request,
+                };
+                if let Some(decision) = prompt_policy_decision(policy, &current.request) {
+                    reply_prompt(&current, decision);
+                    if policy.background {
+                        return Ok(());
+                    }
+                } else {
+                    print_capability_prompt(&current.request)?;
+                    prompt = Some(current);
+                }
+            }
+        }
+
+        let mut status = 0;
+        let wait_result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if wait_result == pid {
+            if prompt.is_some() {
+                println!();
+            }
+            return Ok(());
+        }
+        if wait_result < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(EAGAIN) || error.kind() == io::ErrorKind::WouldBlock {
+                let _ = syscall::call0(syscall::SyscallNumber::ThreadYield);
+            } else {
+                return Err(error);
+            }
+        } else {
+            let _ = syscall::call0(syscall::SyscallNumber::ThreadYield);
         }
     }
 }
