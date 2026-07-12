@@ -11,5 +11,6 @@ requires = [
     "fs.read.all",
     "ipc.client",
     "ipc.server",
+    "capabilities.manage",
     "process.spawn",
 ]

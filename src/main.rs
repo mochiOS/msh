@@ -23,8 +23,10 @@ const KEY_S: u16 = 50;
 const KEY_U: u16 = 52;
 const KEY_Y: u16 = 56;
 const CAPABILITY_DECISION_OPCODE: u32 = 0x4350_5244;
+const RESOLVE_CAPS_OPCODE: u32 = 0x4341_5053;
 const CAPABILITY_SERVICE_NAME: &str = "capability.service";
 const MAX_APP_METADATA_BYTES: usize = 64 * 1024;
+const ROLE_APPLICATION: u64 = 3;
 
 static SHELL_ENDPOINT: AtomicU64 = AtomicU64::new(0);
 
@@ -490,7 +492,7 @@ fn spawn_external(argv: &[String], policy: &ExecutionPromptPolicy) -> io::Result
     }
 
     if is_app_bundle {
-        let pid = spawn_external_direct(&path, &argv[1..], &shell_target_str, prompt_mode)?;
+        let pid = spawn_app_bundle_manifest(&path, &argv[1..], &shell_target_str, prompt_mode)?;
         return wait_foreground_pid(pid, policy);
     }
 
@@ -501,6 +503,103 @@ fn spawn_external(argv: &[String], policy: &ExecutionPromptPolicy) -> io::Result
         .env("MOCHI_PROMPT_MODE", prompt_mode)
         .spawn()?;
     wait_foreground_child(&mut child, policy)
+}
+
+fn encode_nul_list(items: &[String]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for item in items {
+        out.extend_from_slice(item.as_bytes());
+        out.push(0);
+    }
+    out
+}
+
+fn resolve_capabilities(entry_path: &str) -> io::Result<Vec<u8>> {
+    let endpoint = syscall::call2(
+        syscall::SyscallNumber::FindProcessByName,
+        CAPABILITY_SERVICE_NAME.as_ptr() as u64,
+        CAPABILITY_SERVICE_NAME.len() as u64,
+    )
+    .map_err(sys_error_to_io)?;
+    if endpoint == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "capability.service not found",
+        ));
+    }
+
+    let mut request = Vec::with_capacity(4 + entry_path.len());
+    request.extend_from_slice(&RESOLVE_CAPS_OPCODE.to_le_bytes());
+    request.extend_from_slice(entry_path.as_bytes());
+
+    let mut reply = [0u8; 1024];
+    let msg = syscall::call5(
+        syscall::SyscallNumber::IpcCall,
+        endpoint,
+        request.as_ptr() as u64,
+        request.len() as u64,
+        reply.as_mut_ptr() as u64,
+        reply.len() as u64,
+    )
+    .map_err(sys_error_to_io)?;
+    let len = (msg & 0xffff_ffff) as usize;
+    if len < 8 || len > reply.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid capability.service reply",
+        ));
+    }
+    let status = u64::from_le_bytes(
+        reply[..8]
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid status"))?,
+    );
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+
+    Ok(reply[8..len].to_vec())
+}
+
+fn spawn_app_bundle_manifest(
+    path: &str,
+    args: &[String],
+    shell_endpoint: &str,
+    prompt_mode: &str,
+) -> io::Result<i32> {
+    let c_path = CString::new(path)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid executable path"))?;
+    let mut exec_args = Vec::with_capacity(args.len() + 3);
+    exec_args.push(format!("MOCHI_EXECUTABLE_PATH={path}"));
+    exec_args.push(format!("MOCHI_SHELL_ENDPOINT={shell_endpoint}"));
+    exec_args.push(format!("MOCHI_PROMPT_MODE={prompt_mode}"));
+    exec_args.extend(args.iter().cloned());
+    let args_nul = encode_nul_list(&exec_args);
+    let caps_nul = resolve_capabilities(path)?;
+
+    eprintln!("msh: fork exec {}", path);
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        let error = io::Error::last_os_error();
+        eprintln!("msh: fork failed: {error}");
+        return Err(error);
+    }
+    if pid == 0 {
+        unsafe {
+            let result = syscall::raw_syscall5(
+                syscall::SyscallNumber::ExecManifest,
+                c_path.as_ptr() as u64,
+                args_nul.as_ptr() as u64,
+                caps_nul.as_ptr() as u64,
+                caps_nul.len() as u64,
+                ROLE_APPLICATION,
+            );
+            write_execve_failed_result(result.raw() as i64);
+            libc::_exit(127);
+        }
+    }
+    eprintln!("msh: forked child pid={pid}");
+    Ok(pid)
 }
 
 fn spawn_external_direct(
@@ -988,7 +1087,11 @@ fn main() -> io::Result<()> {
     let tty_endpoint = parse_endpoint_arg()?;
     let endpoint = ipc_create()?;
     SHELL_ENDPOINT.store(endpoint, Ordering::Relaxed);
-    ipc_send(tty_endpoint, &endpoint.to_le_bytes())?;
+    let thread_id = current_thread_id()?;
+    let mut shell_targets = [0u8; 16];
+    shell_targets[..8].copy_from_slice(&endpoint.to_le_bytes());
+    shell_targets[8..].copy_from_slice(&thread_id.to_le_bytes());
+    ipc_send(tty_endpoint, &shell_targets)?;
     let mut line = String::new();
     let mut buf = [0u8; core::mem::size_of::<CapabilityPromptRequest>()];
     let mut prompt: Option<PendingPrompt> = None;
