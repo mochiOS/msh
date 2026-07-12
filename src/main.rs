@@ -185,6 +185,15 @@ struct PendingPrompt {
     request: CapabilityPromptRequest,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SpawnAppRequestHeader {
+    opcode: u32,
+    shell_endpoint: u64,
+    interactive: u8,
+    reserved: [u8; 7],
+}
+
 #[derive(Clone, Debug, Default)]
 struct ExecutionPromptPolicy {
     deny_prompts: bool,
@@ -477,21 +486,28 @@ fn spawn_external(argv: &[String], policy: &ExecutionPromptPolicy) -> io::Result
     let is_app_bundle = argv[0].ends_with(".app");
     let path = resolve_command_path(&argv[0])?;
     let shell_endpoint = SHELL_ENDPOINT.load(Ordering::Relaxed);
+    let shell_endpoint_str = shell_endpoint.to_string();
     let shell_target_str = current_thread_id()?.to_string();
     let prompt_mode = if policy.deny_prompts {
-        "deny"
+        String::from("deny")
     } else {
-        "interactive"
+        String::from("interactive")
     };
 
     if policy.background {
         eprintln!("msh: background launch path for {}", argv[0]);
-        spawn_external_direct(&path, &argv[1..], &shell_target_str, prompt_mode)?;
+        spawn_external_direct(&path, &argv[1..], &shell_endpoint_str, prompt_mode.as_str())?;
         return wait_background_capability_request(shell_endpoint, policy);
     }
 
     if is_app_bundle {
-        let pid = spawn_app_bundle_manifest(&path, &argv[1..], &shell_target_str, prompt_mode)?;
+        let pid = spawn_app_bundle_with_prompt(
+            &path,
+            &argv[1..],
+            &shell_endpoint_str,
+            prompt_mode.as_str(),
+            policy,
+        )?;
         eprintln!("msh: launched app pid={pid}");
         return Ok(());
     }
@@ -499,8 +515,8 @@ fn spawn_external(argv: &[String], policy: &ExecutionPromptPolicy) -> io::Result
     let mut child = Command::new(&path)
         .args(&argv[1..])
         .env("MOCHI_EXECUTABLE_PATH", &path)
-        .env("MOCHI_SHELL_ENDPOINT", shell_target_str)
-        .env("MOCHI_PROMPT_MODE", prompt_mode)
+        .env("MOCHI_SHELL_ENDPOINT", shell_endpoint_str)
+        .env("MOCHI_PROMPT_MODE", prompt_mode.as_str())
         .spawn()?;
     wait_foreground_child(&mut child, policy)
 }
@@ -536,12 +552,25 @@ fn spawn_app_bundle_manifest(
     let mut exec_args = Vec::with_capacity(args.len() + 1);
     exec_args.push(path.to_string());
     exec_args.extend(args.iter().cloned());
-    let _ = shell_endpoint;
-    let _ = prompt_mode;
     let args_nul = encode_nul_list(&exec_args);
 
-    let mut request = Vec::with_capacity(4 + args_nul.len());
-    request.extend_from_slice(&SPAWN_APP_OPCODE.to_le_bytes());
+    let interactive = if prompt_mode == "interactive" { 1u8 } else { 0u8 };
+    let shell_endpoint = shell_endpoint
+        .parse::<u64>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid shell endpoint"))?;
+    let header = SpawnAppRequestHeader {
+        opcode: SPAWN_APP_OPCODE,
+        shell_endpoint,
+        interactive,
+        reserved: [0; 7],
+    };
+    let mut request = Vec::with_capacity(core::mem::size_of::<SpawnAppRequestHeader>() + args_nul.len());
+    request.extend_from_slice(unsafe {
+        core::slice::from_raw_parts(
+            (&header as *const SpawnAppRequestHeader).cast::<u8>(),
+            core::mem::size_of::<SpawnAppRequestHeader>(),
+        )
+    });
     request.extend_from_slice(&args_nul);
 
     let mut reply = [0u8; 16];
@@ -1040,6 +1069,149 @@ fn wait_background_capability_request(
         io::ErrorKind::TimedOut,
         "background command did not request a session capability",
     ))
+}
+
+fn spawn_app_bundle_with_prompt(
+    path: &str,
+    args: &[String],
+    shell_endpoint: &str,
+    prompt_mode: &str,
+    policy: &ExecutionPromptPolicy,
+) -> io::Result<i32> {
+    let mut pipe_fds = [0; 2];
+    if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let read_fd = pipe_fds[0];
+    let write_fd = pipe_fds[1];
+    if unsafe { libc::fcntl(read_fd, libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
+        let error = io::Error::last_os_error();
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+        return Err(error);
+    }
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        let error = io::Error::last_os_error();
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+        return Err(error);
+    }
+    if pid == 0 {
+        unsafe {
+            libc::close(read_fd);
+        }
+        let result = spawn_app_bundle_manifest(path, args, shell_endpoint, prompt_mode);
+        let value = match result {
+            Ok(child_pid) => child_pid as i64,
+            Err(error) => -(error.raw_os_error().unwrap_or(1) as i64),
+        };
+        let bytes = value.to_le_bytes();
+        let _ = unsafe { libc::write(write_fd, bytes.as_ptr().cast(), bytes.len()) };
+        unsafe {
+            libc::close(write_fd);
+            libc::_exit(0);
+        }
+    }
+    unsafe {
+        libc::close(write_fd);
+    }
+    let result = wait_app_bundle_launch_result(pid, read_fd, policy);
+    unsafe {
+        libc::close(read_fd);
+    }
+    result
+}
+
+fn wait_app_bundle_launch_result(
+    child_pid: libc::pid_t,
+    read_fd: i32,
+    policy: &ExecutionPromptPolicy,
+) -> io::Result<i32> {
+    let mut buf = [0u8; core::mem::size_of::<CapabilityPromptRequest>()];
+    let mut prompt: Option<PendingPrompt> = None;
+    let mut launch_result = [0u8; 8];
+    let mut launch_len = 0usize;
+
+    loop {
+        if launch_len < launch_result.len() {
+            let remaining = launch_result.len() - launch_len;
+            let n = unsafe {
+                libc::read(
+                    read_fd,
+                    launch_result[launch_len..].as_mut_ptr().cast(),
+                    remaining,
+                )
+            };
+            if n > 0 {
+                launch_len += n as usize;
+            } else if n == 0 {
+                if launch_len == launch_result.len() {
+                    let value = i64::from_le_bytes(launch_result);
+                    if value >= 0 {
+                        return Ok(value as i32);
+                    }
+                    return Err(io::Error::from_raw_os_error((-value) as i32));
+                }
+            } else {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(EAGAIN) {
+                    return Err(error);
+                }
+            }
+        }
+
+        if let Some(msg) = ipc_try_wait(&mut buf)? {
+            let len = (msg & 0xffff_ffff) as usize;
+            if let Some(current) = prompt.as_ref().copied() {
+                if len == core::mem::size_of::<InputEvent>() {
+                    let event =
+                        unsafe { core::ptr::read_unaligned(buf.as_ptr().cast::<InputEvent>()) };
+                    if let Some(decision) = handle_prompt_key_event(&current, event)? {
+                        prompt = None;
+                        reply_prompt(&current, decision);
+                    }
+                    continue;
+                }
+            }
+
+            if let Some(request) = parse_capability_request(&buf[..len.min(buf.len())]) {
+                let current = PendingPrompt {
+                    sender: msg >> 32,
+                    request,
+                };
+                if let Some(decision) = prompt_policy_decision(policy, &current.request) {
+                    reply_prompt(&current, decision);
+                } else {
+                    print_capability_prompt(&current.request)?;
+                    prompt = Some(current);
+                }
+            }
+        }
+
+        let mut status = 0;
+        let wait_result = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
+        if wait_result == child_pid && launch_len == launch_result.len() {
+            let value = i64::from_le_bytes(launch_result);
+            if value >= 0 {
+                return Ok(value as i32);
+            }
+            return Err(io::Error::from_raw_os_error((-value) as i32));
+        }
+        if wait_result < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(EAGAIN) && error.kind() != io::ErrorKind::WouldBlock {
+                return Err(error);
+            }
+        }
+
+        let _ = syscall::call0(syscall::SyscallNumber::ThreadYield);
+    }
 }
 
 fn parse_endpoint_arg() -> io::Result<u64> {
