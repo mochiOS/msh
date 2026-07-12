@@ -23,10 +23,9 @@ const KEY_S: u16 = 50;
 const KEY_U: u16 = 52;
 const KEY_Y: u16 = 56;
 const CAPABILITY_DECISION_OPCODE: u32 = 0x4350_5244;
-const RESOLVE_CAPS_OPCODE: u32 = 0x4341_5053;
+const SPAWN_APP_OPCODE: u32 = 0x4150_5053;
 const CAPABILITY_SERVICE_NAME: &str = "capability.service";
 const MAX_APP_METADATA_BYTES: usize = 64 * 1024;
-const ROLE_APPLICATION: u64 = 3;
 
 static SHELL_ENDPOINT: AtomicU64 = AtomicU64::new(0);
 
@@ -493,7 +492,8 @@ fn spawn_external(argv: &[String], policy: &ExecutionPromptPolicy) -> io::Result
 
     if is_app_bundle {
         let pid = spawn_app_bundle_manifest(&path, &argv[1..], &shell_target_str, prompt_mode)?;
-        return wait_foreground_pid(pid, policy);
+        eprintln!("msh: launched app pid={pid}");
+        return Ok(());
     }
 
     let mut child = Command::new(&path)
@@ -514,7 +514,12 @@ fn encode_nul_list(items: &[String]) -> Vec<u8> {
     out
 }
 
-fn resolve_capabilities(entry_path: &str) -> io::Result<Vec<u8>> {
+fn spawn_app_bundle_manifest(
+    path: &str,
+    args: &[String],
+    shell_endpoint: &str,
+    prompt_mode: &str,
+) -> io::Result<i32> {
     let endpoint = syscall::call2(
         syscall::SyscallNumber::FindProcessByName,
         CAPABILITY_SERVICE_NAME.as_ptr() as u64,
@@ -528,11 +533,18 @@ fn resolve_capabilities(entry_path: &str) -> io::Result<Vec<u8>> {
         ));
     }
 
-    let mut request = Vec::with_capacity(4 + entry_path.len());
-    request.extend_from_slice(&RESOLVE_CAPS_OPCODE.to_le_bytes());
-    request.extend_from_slice(entry_path.as_bytes());
+    let mut exec_args = Vec::with_capacity(args.len() + 1);
+    exec_args.push(path.to_string());
+    exec_args.extend(args.iter().cloned());
+    let _ = shell_endpoint;
+    let _ = prompt_mode;
+    let args_nul = encode_nul_list(&exec_args);
 
-    let mut reply = [0u8; 1024];
+    let mut request = Vec::with_capacity(4 + args_nul.len());
+    request.extend_from_slice(&SPAWN_APP_OPCODE.to_le_bytes());
+    request.extend_from_slice(&args_nul);
+
+    let mut reply = [0u8; 16];
     let msg = syscall::call5(
         syscall::SyscallNumber::IpcCall,
         endpoint,
@@ -543,7 +555,7 @@ fn resolve_capabilities(entry_path: &str) -> io::Result<Vec<u8>> {
     )
     .map_err(sys_error_to_io)?;
     let len = (msg & 0xffff_ffff) as usize;
-    if len < 8 || len > reply.len() {
+    if len < 8 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid capability.service reply",
@@ -558,48 +570,18 @@ fn resolve_capabilities(entry_path: &str) -> io::Result<Vec<u8>> {
         return Err(io::Error::from_raw_os_error(status as i32));
     }
 
-    Ok(reply[8..len].to_vec())
-}
-
-fn spawn_app_bundle_manifest(
-    path: &str,
-    args: &[String],
-    shell_endpoint: &str,
-    prompt_mode: &str,
-) -> io::Result<i32> {
-    let c_path = CString::new(path)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid executable path"))?;
-    let mut exec_args = Vec::with_capacity(args.len() + 3);
-    exec_args.push(format!("MOCHI_EXECUTABLE_PATH={path}"));
-    exec_args.push(format!("MOCHI_SHELL_ENDPOINT={shell_endpoint}"));
-    exec_args.push(format!("MOCHI_PROMPT_MODE={prompt_mode}"));
-    exec_args.extend(args.iter().cloned());
-    let args_nul = encode_nul_list(&exec_args);
-    let caps_nul = resolve_capabilities(path)?;
-
-    eprintln!("msh: fork exec {}", path);
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        let error = io::Error::last_os_error();
-        eprintln!("msh: fork failed: {error}");
-        return Err(error);
+    let pid = u64::from_le_bytes(
+        reply[8..16]
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid pid"))?,
+    );
+    if pid == 0 || pid > i32::MAX as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "capability.service returned invalid pid",
+        ));
     }
-    if pid == 0 {
-        unsafe {
-            let result = syscall::raw_syscall5(
-                syscall::SyscallNumber::ExecManifest,
-                c_path.as_ptr() as u64,
-                args_nul.as_ptr() as u64,
-                caps_nul.as_ptr() as u64,
-                caps_nul.len() as u64,
-                ROLE_APPLICATION,
-            );
-            write_execve_failed_result(result.raw() as i64);
-            libc::_exit(127);
-        }
-    }
-    eprintln!("msh: forked child pid={pid}");
-    Ok(pid)
+    Ok(pid as i32)
 }
 
 fn spawn_external_direct(
