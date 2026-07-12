@@ -17,6 +17,11 @@ const KEY_BACKSPACE: u16 = 2;
 const KEY_TAB: u16 = 3;
 const KEY_ENTER: u16 = 4;
 const KEY_ESCAPE: u16 = 1;
+const KEY_A: u16 = 32;
+const KEY_N: u16 = 45;
+const KEY_S: u16 = 50;
+const KEY_U: u16 = 52;
+const KEY_Y: u16 = 56;
 const CAPABILITY_DECISION_OPCODE: u32 = 0x4350_5244;
 const CAPABILITY_SERVICE_NAME: &str = "capability.service";
 const MAX_APP_METADATA_BYTES: usize = 64 * 1024;
@@ -230,19 +235,19 @@ fn print_capability_prompt(request: &CapabilityPromptRequest) -> io::Result<()> 
     let capability = request.capability();
     let resource = request.resource_path().unwrap_or("(none)");
     println!();
-    println!("{} が追加の権限を要求しています。", executable);
+    println!("{executable} is requesting an additional permission.");
     println!();
-    println!("操作:");
-    println!("  {}", capability);
+    println!("Permission:");
+    println!("  {capability}");
     println!();
-    println!("対象:");
-    println!("  {}", resource);
+    println!("Resource:");
+    println!("  {resource}");
     println!();
-    println!("[y] 今回のみ許可");
-    println!("[s] このプロセスの実行中は許可");
-    println!("[a] 今後も許可");
-    println!("[u] 今後は確認せず、ユーザー権限内で利用可能な権限をすべて許可");
-    println!("[n] 拒否");
+    println!("[y] Allow once");
+    println!("[s] Allow for this process");
+    println!("[a] Always allow this permission");
+    println!("[u] Allow all user-grantable permissions without asking again");
+    println!("[n] Deny");
     io::stdout().flush()
 }
 
@@ -693,6 +698,11 @@ fn handle_prompt_key_event(
     }
 
     match event.keycode {
+        KEY_Y => Ok(Some(PromptDecision::AllowOnce)),
+        KEY_S => Ok(Some(PromptDecision::AllowForProcess)),
+        KEY_A => Ok(Some(PromptDecision::AllowPersistently)),
+        KEY_U => Ok(Some(PromptDecision::AllowAllUserGrantable)),
+        KEY_N => Ok(Some(PromptDecision::Deny)),
         KEY_ENTER | KEY_ESCAPE => Ok(Some(PromptDecision::Deny)),
         _ => {
             let _ = prompt;
