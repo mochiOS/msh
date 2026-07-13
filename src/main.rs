@@ -30,6 +30,7 @@ const LOG_ROOT: &str = "/system/logs/services";
 const MAX_APP_METADATA_BYTES: usize = 64 * 1024;
 const LOG_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const IPC_BUFFER_SIZE: usize = 2048;
+const TTY_OUTPUT_MAGIC: &[u8; 4] = b"TOUT";
 
 static SHELL_ENDPOINT: AtomicU64 = AtomicU64::new(0);
 
@@ -334,6 +335,15 @@ fn print_ipc_payload(bytes: &[u8]) -> io::Result<()> {
         io::stdout().write_all(b"\n")?;
     }
     io::stdout().flush()
+}
+
+fn print_tty_output(bytes: &[u8]) -> io::Result<bool> {
+    if bytes.len() < TTY_OUTPUT_MAGIC.len() || &bytes[..TTY_OUTPUT_MAGIC.len()] != TTY_OUTPUT_MAGIC
+    {
+        return Ok(false);
+    }
+    print_ipc_payload(&bytes[TTY_OUTPUT_MAGIC.len()..])?;
+    Ok(true)
 }
 
 fn print_capability_prompt(request: &CapabilityPromptRequest) -> io::Result<()> {
@@ -1031,6 +1041,10 @@ fn wait_foreground_child(child: &mut Child, policy: &ExecutionPromptPolicy) -> i
         if let Some(msg) = ipc_try_wait(&mut buf)? {
             let len = (msg & 0xffff_ffff) as usize;
             let sender = msg >> 32;
+            let payload = &buf[..len.min(buf.len())];
+            if print_tty_output(payload)? {
+                continue;
+            }
             if let Some(current) = prompt.as_ref().copied() {
                 if len == core::mem::size_of::<InputEvent>() {
                     let event =
@@ -1043,7 +1057,7 @@ fn wait_foreground_child(child: &mut Child, policy: &ExecutionPromptPolicy) -> i
                 }
             }
 
-            if let Some(request) = parse_capability_request(&buf[..len.min(buf.len())]) {
+            if let Some(request) = parse_capability_request(payload) {
                 let current = PendingPrompt {
                     sender: msg >> 32,
                     request,
@@ -1058,7 +1072,7 @@ fn wait_foreground_child(child: &mut Child, policy: &ExecutionPromptPolicy) -> i
                     prompt = Some(current);
                 }
             } else {
-                print_ipc_payload(&buf[..len.min(buf.len())])?;
+                print_ipc_payload(payload)?;
             }
         }
 
@@ -1092,6 +1106,10 @@ fn wait_foreground_pid(pid: i32, policy: &ExecutionPromptPolicy) -> io::Result<(
         if let Some(msg) = ipc_try_wait(&mut buf)? {
             let len = (msg & 0xffff_ffff) as usize;
             let sender = msg >> 32;
+            let payload = &buf[..len.min(buf.len())];
+            if print_tty_output(payload)? {
+                continue;
+            }
             if let Some(current) = prompt.as_ref().copied() {
                 if len == core::mem::size_of::<InputEvent>() {
                     let event =
@@ -1104,7 +1122,7 @@ fn wait_foreground_pid(pid: i32, policy: &ExecutionPromptPolicy) -> io::Result<(
                 }
             }
 
-            if let Some(request) = parse_capability_request(&buf[..len.min(buf.len())]) {
+            if let Some(request) = parse_capability_request(payload) {
                 let current = PendingPrompt {
                     sender: msg >> 32,
                     request,
@@ -1119,7 +1137,7 @@ fn wait_foreground_pid(pid: i32, policy: &ExecutionPromptPolicy) -> io::Result<(
                     prompt = Some(current);
                 }
             } else {
-                print_ipc_payload(&buf[..len.min(buf.len())])?;
+                print_ipc_payload(payload)?;
             }
         }
 
@@ -1159,7 +1177,11 @@ fn wait_background_capability_request(
             Err(error) => return Err(error),
         };
         let len = (msg & 0xffff_ffff) as usize;
-        if let Some(request) = parse_capability_request(&buf[..len.min(buf.len())]) {
+        let payload = &buf[..len.min(buf.len())];
+        if print_tty_output(payload)? {
+            continue;
+        }
+        if let Some(request) = parse_capability_request(payload) {
             let current = PendingPrompt {
                 sender: msg >> 32,
                 request,
@@ -1171,7 +1193,7 @@ fn wait_background_capability_request(
             print_capability_prompt(&current.request)?;
             return Ok(());
         } else {
-            print_ipc_payload(&buf[..len.min(buf.len())])?;
+            print_ipc_payload(payload)?;
         }
     }
     Err(io::Error::new(
@@ -1278,6 +1300,10 @@ fn wait_app_bundle_launch_result(
         if let Some(msg) = ipc_try_wait(&mut buf)? {
             let len = (msg & 0xffff_ffff) as usize;
             let sender = msg >> 32;
+            let payload = &buf[..len.min(buf.len())];
+            if print_tty_output(payload)? {
+                continue;
+            }
             if let Some(current) = prompt.as_ref().copied() {
                 if len == core::mem::size_of::<InputEvent>() {
                     let event =
@@ -1290,7 +1316,7 @@ fn wait_app_bundle_launch_result(
                 }
             }
 
-            if let Some(request) = parse_capability_request(&buf[..len.min(buf.len())]) {
+            if let Some(request) = parse_capability_request(payload) {
                 let current = PendingPrompt { sender, request };
                 if let Some(decision) = prompt_policy_decision(policy, &current.request) {
                     reply_prompt(&current, decision);
@@ -1299,7 +1325,7 @@ fn wait_app_bundle_launch_result(
                     prompt = Some(current);
                 }
             } else {
-                print_ipc_payload(&buf[..len.min(buf.len())])?;
+                print_ipc_payload(payload)?;
             }
         }
 
@@ -1369,6 +1395,10 @@ fn main() -> io::Result<()> {
         };
         let len = (msg & 0xffff_ffff) as usize;
         let sender = msg >> 32;
+        let payload = &buf[..len.min(buf.len())];
+        if print_tty_output(payload)? {
+            continue;
+        }
         if prompt.is_none() {
             if sender == tty_endpoint && len == core::mem::size_of::<InputEvent>() {
                 let event = unsafe { core::ptr::read_unaligned(buf.as_ptr().cast::<InputEvent>()) };
@@ -1380,13 +1410,13 @@ fn main() -> io::Result<()> {
                 }
                 continue;
             }
-            if let Some(request) = parse_capability_request(&buf[..len.min(buf.len())]) {
+            if let Some(request) = parse_capability_request(payload) {
                 let current = PendingPrompt { sender, request };
                 print_capability_prompt(&current.request)?;
                 prompt = Some(current);
                 continue;
             }
-            print_ipc_payload(&buf[..len.min(buf.len())])?;
+            print_ipc_payload(payload)?;
             continue;
         }
 
@@ -1400,12 +1430,12 @@ fn main() -> io::Result<()> {
                 }
                 continue;
             }
-            if let Some(request) = parse_capability_request(&buf[..len.min(buf.len())]) {
+            if let Some(request) = parse_capability_request(payload) {
                 let current = PendingPrompt { sender, request };
                 print_capability_prompt(&current.request)?;
                 prompt = Some(current);
             } else {
-                print_ipc_payload(&buf[..len.min(buf.len())])?;
+                print_ipc_payload(payload)?;
             }
         }
     }
