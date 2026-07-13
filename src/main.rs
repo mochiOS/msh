@@ -1372,7 +1372,10 @@ fn parse_capability_request(buf: &[u8]) -> Option<CapabilityPromptRequest> {
 }
 
 fn main() -> io::Result<()> {
-    let _font = load_font_metrics("/system/resources/msh/ter-u12b.bdf")?;
+    let _font = load_font_metrics("/system/resources/msh/ter-u12b.bdf").unwrap_or(FontMetrics {
+        width: 8,
+        height: 8,
+    });
     let tty_endpoint = parse_endpoint_arg()?;
     let endpoint = ipc_create()?;
     SHELL_ENDPOINT.store(endpoint, Ordering::Relaxed);
