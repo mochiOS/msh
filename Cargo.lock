@@ -26,3 +26,131 @@ dependencies = [
  "libc",
  "mochi-user-syscall",
 ]
+
+[[patch.unused]]
+name = "addr2line"
+version = "0.25.1"
+
+[[patch.unused]]
+name = "adler2"
+version = "2.0.1"
+
+[[patch.unused]]
+name = "cc"
+version = "1.2.0"
+
+[[patch.unused]]
+name = "cfg-if"
+version = "1.0.4"
+
+[[patch.unused]]
+name = "dlmalloc"
+version = "0.2.13"
+
+[[patch.unused]]
+name = "foldhash"
+version = "0.2.0"
+
+[[patch.unused]]
+name = "fortanix-sgx-abi"
+version = "0.6.1"
+
+[[patch.unused]]
+name = "getopts"
+version = "0.2.24"
+
+[[patch.unused]]
+name = "gimli"
+version = "0.32.3"
+
+[[patch.unused]]
+name = "hashbrown"
+version = "0.17.1"
+
+[[patch.unused]]
+name = "hermit-abi"
+version = "0.5.2"
+
+[[patch.unused]]
+name = "memchr"
+version = "2.7.6"
+
+[[patch.unused]]
+name = "miniz_oxide"
+version = "0.8.9"
+
+[[patch.unused]]
+name = "moto-rt"
+version = "0.16.0"
+
+[[patch.unused]]
+name = "object"
+version = "0.37.3"
+
+[[patch.unused]]
+name = "r-efi"
+version = "5.3.0"
+
+[[patch.unused]]
+name = "r-efi-alloc"
+version = "2.1.0"
+
+[[patch.unused]]
+name = "rand"
+version = "0.9.2"
+
+[[patch.unused]]
+name = "rand_core"
+version = "0.9.3"
+
+[[patch.unused]]
+name = "rand_xorshift"
+version = "0.4.0"
+
+[[patch.unused]]
+name = "rustc-demangle"
+version = "0.1.28"
+
+[[patch.unused]]
+name = "rustc-literal-escaper"
+version = "0.0.8"
+
+[[patch.unused]]
+name = "rustc-std-workspace-alloc"
+version = "1.99.0"
+
+[[patch.unused]]
+name = "rustc-std-workspace-core"
+version = "1.99.0"
+
+[[patch.unused]]
+name = "rustc-std-workspace-std"
+version = "1.99.0"
+
+[[patch.unused]]
+name = "shlex"
+version = "1.3.0"
+
+[[patch.unused]]
+name = "unwinding"
+version = "0.2.8"
+
+[[patch.unused]]
+name = "vex-sdk"
+version = "0.27.1"
+
+[[patch.unused]]
+name = "wasip1"
+version = "1.0.0"
+
+[[patch.unused]]
+name = "wasip2"
+version = "1.0.3+wasi-0.2.9"
+
+[[patch.unused]]
+name = "wasip3"
+version = "0.6.0+wasi-0.3.0-rc-2026-03-15"
+
+[[patch.unused]]
+name = "wit-bindgen"
+version = "0.57.1"
