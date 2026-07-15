@@ -1403,7 +1403,7 @@ fn main() -> io::Result<()> {
             continue;
         }
         if prompt.is_none() {
-            if sender == tty_endpoint && len == core::mem::size_of::<InputEvent>() {
+            if len == core::mem::size_of::<InputEvent>() {
                 let event = unsafe { core::ptr::read_unaligned(buf.as_ptr().cast::<InputEvent>()) };
                 if let Some(command) = handle_key_event(&mut line, event)? {
                     if !run_command(&command)? {
@@ -1424,7 +1424,7 @@ fn main() -> io::Result<()> {
         }
 
         if let Some(current) = prompt.as_ref().copied() {
-            if sender == tty_endpoint && len == core::mem::size_of::<InputEvent>() {
+            if len == core::mem::size_of::<InputEvent>() {
                 let event = unsafe { core::ptr::read_unaligned(buf.as_ptr().cast::<InputEvent>()) };
                 if let Some(decision) = handle_prompt_key_event(&current, event)? {
                     prompt = None;
