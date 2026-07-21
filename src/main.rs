@@ -7,6 +7,10 @@ use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use mochios_capability_protocol::{
+    CapabilityClass, CapabilityDecision, CapabilityDecisionRequest, CapabilityPromptRequest,
+    CAPABILITY_DECISION_OPCODE,
+};
 use mochi_user_syscall as syscall;
 
 const EVENT_KIND_KEY: u16 = 1;
@@ -23,7 +27,6 @@ const KEY_N: u16 = 45;
 const KEY_S: u16 = 50;
 const KEY_U: u16 = 52;
 const KEY_Y: u16 = 56;
-const CAPABILITY_DECISION_OPCODE: u32 = 0x4350_5244;
 const SPAWN_APP_OPCODE: u32 = 0x4150_5053;
 const CAPABILITY_SERVICE_NAME: &str = "capability.service";
 const LOG_ROOT: &str = "/system/logs/services";
@@ -33,91 +36,6 @@ const IPC_BUFFER_SIZE: usize = 2048;
 const TTY_OUTPUT_MAGIC: &[u8; 4] = b"TOUT";
 
 static SHELL_ENDPOINT: AtomicU64 = AtomicU64::new(0);
-
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CapabilityDecision {
-    AllowOnce = 1,
-    AllowForProcess = 2,
-    AllowPersistently = 3,
-    AllowAllUserGrantable = 4,
-    Deny = 5,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CapabilityDecisionRequest {
-    opcode: u32,
-    decision: CapabilityDecision,
-    reserved: u64,
-    request: CapabilityPromptRequest,
-}
-
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum CapabilityClass {
-    #[default]
-    UserGrantable = 1,
-    Privileged = 2,
-    SystemOnly = 3,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CapabilityExecutableIdentity {
-    path_len: u16,
-    reserved: u16,
-    digest: [u8; 32],
-    path: [u8; 256],
-}
-
-impl Default for CapabilityExecutableIdentity {
-    fn default() -> Self {
-        Self {
-            path_len: 0,
-            reserved: 0,
-            digest: [0; 32],
-            path: [0; 256],
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CapabilityResourceDescriptor {
-    kind: u32,
-    path_len: u16,
-    reserved: u16,
-    path: [u8; 256],
-}
-
-impl Default for CapabilityResourceDescriptor {
-    fn default() -> Self {
-        Self {
-            kind: 0,
-            path_len: 0,
-            reserved: 0,
-            path: [0; 256],
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CapabilityPromptRequest {
-    opcode: u32,
-    process_id: u64,
-    executable: CapabilityExecutableIdentity,
-    capability_class: CapabilityClass,
-    capability_len: u16,
-    resource: CapabilityResourceDescriptor,
-    reason_len: u16,
-    interactive: u8,
-    decision_scope: u8,
-    reserved0: u16,
-    capability: [u8; 64],
-    reason: [u8; 128],
-}
 
 struct LogTail {
     path: PathBuf,
@@ -199,47 +117,6 @@ impl LogTailer {
         io::stdout().flush()
     }
 }
-
-impl Default for CapabilityPromptRequest {
-    fn default() -> Self {
-        Self {
-            opcode: 0,
-            process_id: 0,
-            executable: CapabilityExecutableIdentity::default(),
-            capability_class: CapabilityClass::UserGrantable,
-            capability_len: 0,
-            resource: CapabilityResourceDescriptor::default(),
-            reason_len: 0,
-            interactive: 0,
-            decision_scope: 0,
-            reserved0: 0,
-            capability: [0; 64],
-            reason: [0; 128],
-        }
-    }
-}
-
-impl CapabilityPromptRequest {
-    fn capability(&self) -> &str {
-        let len = self.capability_len as usize;
-        core::str::from_utf8(&self.capability[..len]).unwrap_or("")
-    }
-
-    fn executable_path(&self) -> &str {
-        let len = self.executable.path_len as usize;
-        core::str::from_utf8(&self.executable.path[..len]).unwrap_or("")
-    }
-
-    fn resource_path(&self) -> Option<&str> {
-        if self.resource.path_len == 0 {
-            return None;
-        }
-        let len = self.resource.path_len as usize;
-        core::str::from_utf8(&self.resource.path[..len]).ok()
-    }
-}
-
-const CAPABILITY_PROMPT_OPCODE: u32 = 0x4350_5251;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -347,9 +224,16 @@ fn print_tty_output(bytes: &[u8]) -> io::Result<bool> {
 }
 
 fn print_capability_prompt(request: &CapabilityPromptRequest) -> io::Result<()> {
-    let executable = request.executable_path();
-    let capability = request.capability();
-    let resource = request.resource_path().unwrap_or("(none)");
+    let executable = request
+        .executable_path()
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let capability = request
+        .capability()
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let resource = request
+        .resource_path()
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
+        .unwrap_or("(none)");
     println!();
     println!("{executable} is requesting an additional permission.");
     println!();
@@ -567,7 +451,10 @@ fn prompt_policy_decision(
     if policy.allow_all_user && request.capability_class == CapabilityClass::UserGrantable {
         return Some(PromptDecision::AllowAllUserGrantable);
     }
-    let capability = request.capability();
+    let capability = match request.capability() {
+        Ok(capability) => capability,
+        Err(_) => return None,
+    };
     if policy
         .allow_session
         .iter()
@@ -1361,14 +1248,7 @@ fn parse_endpoint_arg() -> io::Result<u64> {
 }
 
 fn parse_capability_request(buf: &[u8]) -> Option<CapabilityPromptRequest> {
-    if buf.len() < core::mem::size_of::<CapabilityPromptRequest>() {
-        return None;
-    }
-    let req = unsafe { core::ptr::read_unaligned(buf.as_ptr().cast::<CapabilityPromptRequest>()) };
-    if req.opcode != CAPABILITY_PROMPT_OPCODE {
-        return None;
-    }
-    Some(req)
+    mochios_capability_protocol::decode_request(buf).ok()
 }
 
 fn main() -> io::Result<()> {

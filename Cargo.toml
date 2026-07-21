@@ -11,6 +11,7 @@ libc = { path = "../../libraries/libc" }
 [dependencies]
 libc = "0.2.185"
 mochi-user-syscall = { path = "../../user/crates/syscall" }
+mochios-capability-protocol = { path = "../../user/crates/capability-protocol" }
 
 [profile.dev]
 panic = "abort"

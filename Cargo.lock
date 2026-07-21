@@ -20,16 +20,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mochios-capability-protocol"
+version = "0.1.0"
+
+[[package]]
 name = "msh"
 version = "0.1.0"
 dependencies = [
  "libc",
  "mochi-user-syscall",
+ "mochios-capability-protocol",
 ]
 
 [[patch.unused]]
 name = "addr2line"
-version = "0.25.1"
+version = "0.27.0"
 
 [[patch.unused]]
 name = "adler2"
@@ -61,7 +66,7 @@ version = "0.2.24"
 
 [[patch.unused]]
 name = "gimli"
-version = "0.32.3"
+version = "0.34.0"
 
 [[patch.unused]]
 name = "hashbrown"
@@ -77,7 +82,7 @@ version = "2.7.6"
 
 [[patch.unused]]
 name = "miniz_oxide"
-version = "0.8.9"
+version = "0.9.1"
 
 [[patch.unused]]
 name = "moto-rt"
@@ -85,7 +90,7 @@ version = "0.16.0"
 
 [[patch.unused]]
 name = "object"
-version = "0.37.3"
+version = "0.39.1"
 
 [[patch.unused]]
 name = "r-efi"
@@ -133,7 +138,7 @@ version = "1.3.0"
 
 [[patch.unused]]
 name = "unwinding"
-version = "0.2.8"
+version = "0.2.10"
 
 [[patch.unused]]
 name = "vex-sdk"
