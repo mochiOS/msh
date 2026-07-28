@@ -5,13 +5,10 @@ edition = "2024"
 
 [workspace]
 
-[patch.crates-io]
-libc = { path = "../../libraries/libc" }
-
 [dependencies]
-libc = "0.2.185"
-mochi-user-syscall = { path = "../../user/crates/syscall" }
-mochios-capability-protocol = { path = "../../user/crates/capability-protocol" }
+libc = { git = "https://github.com/mochiOS/libc", package = "libc" }
+mochi-user-syscall = { git = "https://github.com/mochiOS/syscalls", package = "mochi-user-syscall" }
+mochios-capability-protocol = { git = "https://github.com/mochiOS/syscalls", package = "mochios-capability-protocol" }
 
 [profile.dev]
 panic = "abort"
