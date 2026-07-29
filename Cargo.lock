@@ -5,6 +5,7 @@ version = 4
 [[package]]
 name = "libc"
 version = "0.2.185"
+source = "git+https://github.com/mochiOS/libc#d2072c233a70c5044bc9adc1d6c60cafc3e663e1"
 
 [[package]]
 name = "mnu-abi"
@@ -15,6 +16,7 @@ checksum = "522a13d1239f1c600ea0cb0c871d48a98986ba36d5802417fe37c177a1245324"
 [[package]]
 name = "mochi-user-syscall"
 version = "0.1.0"
+source = "git+https://github.com/mochiOS/syscalls#e41ac7909a7ee11e9f89172d2e18db9a5a171f6f"
 dependencies = [
  "mnu-abi",
 ]
@@ -22,6 +24,7 @@ dependencies = [
 [[package]]
 name = "mochios-capability-protocol"
 version = "0.1.0"
+source = "git+https://github.com/mochiOS/syscalls#e41ac7909a7ee11e9f89172d2e18db9a5a171f6f"
 
 [[package]]
 name = "msh"
@@ -75,6 +78,10 @@ version = "0.17.1"
 [[patch.unused]]
 name = "hermit-abi"
 version = "0.5.2"
+
+[[patch.unused]]
+name = "libc"
+version = "0.2.185"
 
 [[patch.unused]]
 name = "memchr"
