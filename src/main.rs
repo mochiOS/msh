@@ -36,6 +36,7 @@ const IPC_BUFFER_SIZE: usize = 2048;
 const TTY_OUTPUT_MAGIC: &[u8; 4] = b"TOUT";
 const STDIO_INPUT_ARG: &str = "--stdio-input";
 const STDIN_FD: libc::c_int = 0;
+const MAX_STDIO_EVENTS_PER_TICK: usize = 256;
 
 static SHELL_ENDPOINT: AtomicU64 = AtomicU64::new(0);
 
@@ -1381,12 +1382,19 @@ fn main() -> io::Result<()> {
 
     print_prompt()?;
     loop {
-        if let Some(input) = stdio_input.as_mut()
-            && let Some(event) = input.poll()?
-        {
-            if !handle_terminal_input(&mut line, &mut prompt, event)? {
-                break;
+        let mut handled_stdio_input = false;
+        if let Some(input) = stdio_input.as_mut() {
+            for _ in 0..MAX_STDIO_EVENTS_PER_TICK {
+                let Some(event) = input.poll()? else {
+                    break;
+                };
+                handled_stdio_input = true;
+                if !handle_terminal_input(&mut line, &mut prompt, event)? {
+                    return Ok(());
+                }
             }
+        }
+        if handled_stdio_input {
             continue;
         }
         let Some(msg) = ipc_try_wait(&mut buf)? else {
