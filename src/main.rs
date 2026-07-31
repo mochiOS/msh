@@ -7,11 +7,11 @@ use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use mochios_capability_protocol::{
-    CapabilityClass, CapabilityDecision, CapabilityDecisionRequest, CapabilityPromptRequest,
-    CAPABILITY_DECISION_OPCODE,
-};
 use mochi_user_syscall as syscall;
+use mochios_capability_protocol::{
+    CAPABILITY_DECISION_OPCODE, CapabilityClass, CapabilityDecision, CapabilityDecisionRequest,
+    CapabilityPromptRequest,
+};
 
 const EVENT_KIND_KEY: u16 = 1;
 const FLAG_PRESS: u16 = 1 << 0;
@@ -34,6 +34,8 @@ const MAX_APP_METADATA_BYTES: usize = 64 * 1024;
 const LOG_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const IPC_BUFFER_SIZE: usize = 2048;
 const TTY_OUTPUT_MAGIC: &[u8; 4] = b"TOUT";
+const STDIO_INPUT_ARG: &str = "--stdio-input";
+const STDIN_FD: libc::c_int = 0;
 
 static SHELL_ENDPOINT: AtomicU64 = AtomicU64::new(0);
 
@@ -45,6 +47,63 @@ struct LogTail {
 struct LogTailer {
     logs: Vec<LogTail>,
     next_poll: Instant,
+}
+
+enum InputMode {
+    TtyEndpoint(u64),
+    Stdio,
+}
+
+struct StdioInput {
+    bytes: [u8; core::mem::size_of::<InputEvent>()],
+    length: usize,
+}
+
+impl StdioInput {
+    fn new() -> io::Result<Self> {
+        let flags = unsafe { libc::fcntl(STDIN_FD, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { libc::fcntl(STDIN_FD, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            bytes: [0; core::mem::size_of::<InputEvent>()],
+            length: 0,
+        })
+    }
+
+    fn poll(&mut self) -> io::Result<Option<InputEvent>> {
+        let remaining = self.bytes.len() - self.length;
+        let read = unsafe {
+            libc::read(
+                STDIN_FD,
+                self.bytes[self.length..].as_mut_ptr().cast(),
+                remaining,
+            )
+        };
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "terminal input closed",
+            ));
+        }
+        if read < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(EAGAIN) || error.kind() == io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+
+        self.length += read as usize;
+        if self.length != self.bytes.len() {
+            return Ok(None);
+        }
+        self.length = 0;
+        Ok(Some(InputEvent::decode(&self.bytes)))
+    }
 }
 
 impl LogTailer {
@@ -131,6 +190,23 @@ struct InputEvent {
     value_z: i32,
     modifiers: u32,
     reserved: u32,
+}
+
+impl InputEvent {
+    fn decode(bytes: &[u8; 32]) -> Self {
+        Self {
+            kind: u16::from_le_bytes([bytes[0], bytes[1]]),
+            flags: u16::from_le_bytes([bytes[2], bytes[3]]),
+            keycode: u16::from_le_bytes([bytes[4], bytes[5]]),
+            detail: u16::from_le_bytes([bytes[6], bytes[7]]),
+            codepoint: u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            value_x: i32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+            value_y: i32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]),
+            value_z: i32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]),
+            modifiers: u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]),
+            reserved: u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -282,8 +358,8 @@ fn capability_decision(decision: PromptDecision) -> CapabilityDecision {
     }
 }
 
-fn redraw_line(line: &str) -> io::Result<()> {
-    print!("\n{}{}", prompt_string(), line);
+fn erase_last_character() -> io::Result<()> {
+    print!("\u{8} \u{8}");
     io::stdout().flush()
 }
 
@@ -769,7 +845,7 @@ fn handle_key_event(line: &mut String, event: InputEvent) -> io::Result<Option<S
     match event.keycode {
         KEY_BACKSPACE => {
             if line.pop().is_some() {
-                redraw_line(line)?;
+                erase_last_character()?;
             }
             Ok(None)
         }
@@ -817,6 +893,30 @@ fn handle_prompt_key_event(
             Ok(None)
         }
     }
+}
+
+fn handle_terminal_input(
+    line: &mut String,
+    prompt: &mut Option<PendingPrompt>,
+    event: InputEvent,
+) -> io::Result<bool> {
+    if let Some(current) = prompt.as_ref().copied() {
+        if let Some(decision) = handle_prompt_key_event(&current, event)? {
+            *prompt = None;
+            reply_prompt(&current, decision);
+            print_prompt()?;
+        }
+        return Ok(true);
+    }
+
+    let Some(command) = handle_key_event(line, event)? else {
+        return Ok(true);
+    };
+    if !run_command(&command)? {
+        return Ok(false);
+    }
+    print_prompt()?;
+    Ok(true)
 }
 
 fn reply_prompt(prompt: &PendingPrompt, decision: PromptDecision) {
@@ -1236,14 +1336,18 @@ fn wait_app_bundle_launch_result(
     }
 }
 
-fn parse_endpoint_arg() -> io::Result<u64> {
+fn parse_input_mode() -> io::Result<InputMode> {
     let mut args = env::args();
     let _program = args.next();
-    let endpoint = args
+    let argument = args
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing endpoint arg"))?;
-    endpoint
+    if argument == STDIO_INPUT_ARG {
+        return Ok(InputMode::Stdio);
+    }
+    argument
         .parse::<u64>()
+        .map(InputMode::TtyEndpoint)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid endpoint arg"))
 }
 
@@ -1256,14 +1360,20 @@ fn main() -> io::Result<()> {
         width: 8,
         height: 8,
     });
-    let tty_endpoint = parse_endpoint_arg()?;
+    let input_mode = parse_input_mode()?;
     let endpoint = ipc_create()?;
     SHELL_ENDPOINT.store(endpoint, Ordering::Relaxed);
-    let thread_id = current_thread_id()?;
-    let mut shell_targets = [0u8; 16];
-    shell_targets[..8].copy_from_slice(&endpoint.to_le_bytes());
-    shell_targets[8..].copy_from_slice(&thread_id.to_le_bytes());
-    ipc_send(tty_endpoint, &shell_targets)?;
+    let mut stdio_input = match input_mode {
+        InputMode::TtyEndpoint(tty_endpoint) => {
+            let thread_id = current_thread_id()?;
+            let mut shell_targets = [0u8; 16];
+            shell_targets[..8].copy_from_slice(&endpoint.to_le_bytes());
+            shell_targets[8..].copy_from_slice(&thread_id.to_le_bytes());
+            ipc_send(tty_endpoint, &shell_targets)?;
+            None
+        }
+        InputMode::Stdio => Some(StdioInput::new()?),
+    };
     let mut line = String::new();
     let mut buf = [0u8; IPC_BUFFER_SIZE];
     let mut prompt: Option<PendingPrompt> = None;
@@ -1271,6 +1381,14 @@ fn main() -> io::Result<()> {
 
     print_prompt()?;
     loop {
+        if let Some(input) = stdio_input.as_mut()
+            && let Some(event) = input.poll()?
+        {
+            if !handle_terminal_input(&mut line, &mut prompt, event)? {
+                break;
+            }
+            continue;
+        }
         let Some(msg) = ipc_try_wait(&mut buf)? else {
             let _ = log_tailer.poll();
             let _ = syscall::call0(syscall::SyscallNumber::ThreadYield);
@@ -1285,11 +1403,8 @@ fn main() -> io::Result<()> {
         if prompt.is_none() {
             if len == core::mem::size_of::<InputEvent>() {
                 let event = unsafe { core::ptr::read_unaligned(buf.as_ptr().cast::<InputEvent>()) };
-                if let Some(command) = handle_key_event(&mut line, event)? {
-                    if !run_command(&command)? {
-                        break;
-                    }
-                    print_prompt()?;
+                if !handle_terminal_input(&mut line, &mut prompt, event)? {
+                    break;
                 }
                 continue;
             }
@@ -1303,14 +1418,10 @@ fn main() -> io::Result<()> {
             continue;
         }
 
-        if let Some(current) = prompt.as_ref().copied() {
+        if prompt.is_some() {
             if len == core::mem::size_of::<InputEvent>() {
                 let event = unsafe { core::ptr::read_unaligned(buf.as_ptr().cast::<InputEvent>()) };
-                if let Some(decision) = handle_prompt_key_event(&current, event)? {
-                    prompt = None;
-                    reply_prompt(&current, decision);
-                    print_prompt()?;
-                }
+                let _ = handle_terminal_input(&mut line, &mut prompt, event)?;
                 continue;
             }
             if let Some(request) = parse_capability_request(payload) {
@@ -1323,4 +1434,28 @@ fn main() -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EVENT_KIND_KEY, FLAG_PRESS, InputEvent};
+
+    #[test]
+    fn decodes_stdio_input_wire_as_little_endian() {
+        let mut bytes = [0u8; 32];
+        bytes[0..2].copy_from_slice(&EVENT_KIND_KEY.to_le_bytes());
+        bytes[2..4].copy_from_slice(&FLAG_PRESS.to_le_bytes());
+        bytes[4..6].copy_from_slice(&4u16.to_le_bytes());
+        bytes[8..12].copy_from_slice(&('x' as u32).to_le_bytes());
+        bytes[24..28].copy_from_slice(&7u32.to_le_bytes());
+
+        let event = InputEvent::decode(&bytes);
+
+        assert_eq!(event.kind, EVENT_KIND_KEY);
+        assert_eq!(event.flags, FLAG_PRESS);
+        assert_eq!(event.keycode, 4);
+        assert_eq!(event.codepoint, 'x' as u32);
+        assert_eq!(event.modifiers, 7);
+        assert_eq!(event.reserved, 0);
+    }
 }
