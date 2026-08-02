@@ -36,6 +36,10 @@ dependencies = [
 ]
 
 [[patch.unused]]
+name = "viewkit"
+version = "1.0.1"
+
+[[patch.unused]]
 name = "addr2line"
 version = "0.27.0"
 
@@ -152,6 +156,10 @@ name = "vex-sdk"
 version = "0.27.1"
 
 [[patch.unused]]
+name = "viewkit"
+version = "1.0.1"
+
+[[patch.unused]]
 name = "wasip1"
 version = "1.0.0"
 
@@ -166,3 +174,7 @@ version = "0.6.0+wasi-0.3.0-rc-2026-03-15"
 [[patch.unused]]
 name = "wit-bindgen"
 version = "0.57.1"
+
+[[patch.unused]]
+name = "mnu-abi"
+version = "0.1.0"
