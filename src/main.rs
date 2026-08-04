@@ -29,6 +29,8 @@ const KEY_U: u16 = 52;
 const KEY_Y: u16 = 56;
 const SPAWN_APP_OPCODE: u32 = 0x4150_5053;
 const CAPABILITY_SERVICE_NAME: &str = "capability.service";
+const EXEC_MANIFEST_ENV_PREFIX: &str = "__MOCHI_EXEC_ENV=";
+const SESSION_ENVIRONMENT_NAMES: [&str; 4] = ["HOME", "USER", "LOGNAME", "SHELL"];
 const LOG_ROOT: &str = "/system/logs/services";
 const MAX_APP_METADATA_BYTES: usize = 64 * 1024;
 const LOG_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -619,8 +621,13 @@ fn spawn_app_bundle_manifest(
         ));
     }
 
-    let mut exec_args = Vec::with_capacity(args.len() + 1);
+    let mut exec_args = Vec::with_capacity(args.len() + SESSION_ENVIRONMENT_NAMES.len() + 1);
     exec_args.push(path.to_string());
+    for name in SESSION_ENVIRONMENT_NAMES {
+        if let Ok(value) = env::var(name) {
+            exec_args.push(format!("{EXEC_MANIFEST_ENV_PREFIX}{name}={value}"));
+        }
+    }
     exec_args.extend(args.iter().cloned());
     let args_nul = encode_nul_list(&exec_args);
 
