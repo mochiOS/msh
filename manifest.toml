@@ -9,6 +9,8 @@ path = "/bin/msh"
 kind = "application"
 requires = [
     "fs.read.all",
+    "fs.write.tmp",
+    "fs.write.user",
     "ipc.client",
     "ipc.server",
     "net.connect",
