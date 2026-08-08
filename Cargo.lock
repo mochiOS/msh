@@ -36,6 +36,10 @@ dependencies = [
 ]
 
 [[patch.unused]]
+name = "mnu-abi"
+version = "0.1.0"
+
+[[patch.unused]]
 name = "viewkit"
 version = "1.0.1"
 
@@ -60,5 +64,5 @@ name = "viewkit"
 version = "1.0.1"
 
 [[patch.unused]]
-name = "mnu-abi"
+name = "mboot-protocol"
 version = "0.1.0"
