@@ -15,6 +15,7 @@ use mochios_capability_protocol::{
 
 const EVENT_KIND_KEY: u16 = 1;
 const FLAG_PRESS: u16 = 1 << 0;
+const INPUT_MOD_CONTROL: u32 = 1 << 1;
 const EAGAIN: i32 = 11;
 const EAGAIN_U64: u64 = 11;
 
@@ -78,6 +79,22 @@ impl StdioInput {
     }
 
     fn poll(&mut self) -> io::Result<Option<InputEvent>> {
+        self.poll_raw()
+    }
+
+    fn poll_interrupt(&mut self) -> io::Result<bool> {
+        for _ in 0..MAX_STDIO_EVENTS_PER_TICK {
+            let Some(event) = self.poll_raw()? else {
+                break;
+            };
+            if is_interrupt_event(event) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn poll_raw(&mut self) -> io::Result<Option<InputEvent>> {
         let remaining = self.bytes.len() - self.length;
         let read = unsafe {
             libc::read(
@@ -544,7 +561,11 @@ fn prompt_policy_decision(
     None
 }
 
-fn spawn_external(argv: &[String], policy: &ExecutionPromptPolicy) -> io::Result<()> {
+fn spawn_external(
+    argv: &[String],
+    policy: &ExecutionPromptPolicy,
+    foreground_input: Option<&mut StdioInput>,
+) -> io::Result<()> {
     if argv.is_empty() {
         return Ok(());
     }
@@ -590,7 +611,7 @@ fn spawn_external(argv: &[String], policy: &ExecutionPromptPolicy) -> io::Result
         .env("MOCHI_SHELL_ENDPOINT", shell_endpoint_str)
         .env("MOCHI_PROMPT_MODE", prompt_mode.as_str())
         .spawn()?;
-    wait_foreground_child(&mut child, policy)
+    wait_foreground_child(&mut child, policy, foreground_input)
 }
 
 fn encode_nul_list(items: &[String]) -> Vec<u8> {
@@ -786,7 +807,7 @@ unsafe fn write_execve_failed_result(result: i64) {
     let _ = unsafe { libc::write(2, buf.as_ptr().cast(), len) };
 }
 
-fn run_command(line: &str) -> io::Result<bool> {
+fn run_command(line: &str, foreground_input: Option<&mut StdioInput>) -> io::Result<bool> {
     let argv: Vec<String> = line.split_whitespace().map(ToOwned::to_owned).collect();
     if argv.is_empty() {
         return Ok(true);
@@ -828,7 +849,7 @@ fn run_command(line: &str) -> io::Result<bool> {
                 println!("notfound");
                 return Ok(true);
             }
-            if let Err(error) = spawn_external(external_argv, &policy) {
+            if let Err(error) = spawn_external(external_argv, &policy, foreground_input) {
                 eprintln!("{}: {error}", external_argv[0]);
             }
             Ok(true)
@@ -839,6 +860,12 @@ fn run_command(line: &str) -> io::Result<bool> {
 fn handle_key_event(line: &mut String, event: InputEvent) -> io::Result<Option<String>> {
     if event.kind != EVENT_KIND_KEY || (event.flags & FLAG_PRESS) == 0 {
         return Ok(None);
+    }
+
+    if is_interrupt_event(event) {
+        line.clear();
+        println!("^C");
+        return Ok(Some(String::new()));
     }
 
     if event.codepoint != 0 {
@@ -907,6 +934,7 @@ fn handle_terminal_input(
     line: &mut String,
     prompt: &mut Option<PendingPrompt>,
     event: InputEvent,
+    foreground_input: Option<&mut StdioInput>,
 ) -> io::Result<bool> {
     if let Some(current) = prompt.as_ref().copied() {
         if let Some(decision) = handle_prompt_key_event(&current, event)? {
@@ -920,7 +948,7 @@ fn handle_terminal_input(
     let Some(command) = handle_key_event(line, event)? else {
         return Ok(true);
     };
-    if !run_command(&command)? {
+    if !run_command(&command, foreground_input)? {
         return Ok(false);
     }
     print_prompt()?;
@@ -1028,11 +1056,20 @@ fn ipc_try_wait(buf: &mut [u8]) -> io::Result<Option<u64>> {
     }
 }
 
-fn wait_foreground_child(child: &mut Child, policy: &ExecutionPromptPolicy) -> io::Result<()> {
+fn wait_foreground_child(
+    child: &mut Child,
+    policy: &ExecutionPromptPolicy,
+    mut foreground_input: Option<&mut StdioInput>,
+) -> io::Result<()> {
     let mut buf = [0u8; IPC_BUFFER_SIZE];
     let mut prompt: Option<PendingPrompt> = None;
 
     loop {
+        if let Some(input) = foreground_input.as_deref_mut()
+            && input.poll_interrupt()?
+        {
+            interrupt_foreground(child.id() as i32)?;
+        }
         if let Some(msg) = ipc_try_wait(&mut buf)? {
             let len = (msg & 0xffff_ffff) as usize;
             let sender = msg >> 32;
@@ -1040,10 +1077,13 @@ fn wait_foreground_child(child: &mut Child, policy: &ExecutionPromptPolicy) -> i
             if print_tty_output(payload)? {
                 continue;
             }
-            if let Some(current) = prompt.as_ref().copied() {
-                if len == core::mem::size_of::<InputEvent>() {
-                    let event =
-                        unsafe { core::ptr::read_unaligned(buf.as_ptr().cast::<InputEvent>()) };
+            if len == core::mem::size_of::<InputEvent>() {
+                let event = unsafe { core::ptr::read_unaligned(buf.as_ptr().cast::<InputEvent>()) };
+                if is_interrupt_event(event) {
+                    interrupt_foreground(child.id() as i32)?;
+                    continue;
+                }
+                if let Some(current) = prompt.as_ref().copied() {
                     if let Some(decision) = handle_prompt_key_event(&current, event)? {
                         prompt = None;
                         reply_prompt(&current, decision);
@@ -1153,6 +1193,27 @@ fn wait_foreground_pid(pid: i32, policy: &ExecutionPromptPolicy) -> io::Result<(
             }
         } else {
             let _ = syscall::call0(syscall::SyscallNumber::ThreadYield);
+        }
+    }
+}
+
+fn is_interrupt_event(event: InputEvent) -> bool {
+    event.kind == EVENT_KIND_KEY
+        && (event.flags & FLAG_PRESS) != 0
+        && (event.modifiers & INPUT_MOD_CONTROL) != 0
+        && matches!(char::from_u32(event.codepoint), Some('c' | 'C'))
+}
+
+fn interrupt_foreground(pid: i32) -> io::Result<()> {
+    println!("^C");
+    if unsafe { libc::kill(pid, libc::SIGINT) } == 0 {
+        Ok(())
+    } else {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error)
         }
     }
 }
@@ -1396,7 +1457,7 @@ fn main() -> io::Result<()> {
                     break;
                 };
                 handled_stdio_input = true;
-                if !handle_terminal_input(&mut line, &mut prompt, event)? {
+                if !handle_terminal_input(&mut line, &mut prompt, event, Some(input))? {
                     return Ok(());
                 }
             }
@@ -1418,7 +1479,7 @@ fn main() -> io::Result<()> {
         if prompt.is_none() {
             if len == core::mem::size_of::<InputEvent>() {
                 let event = unsafe { core::ptr::read_unaligned(buf.as_ptr().cast::<InputEvent>()) };
-                if !handle_terminal_input(&mut line, &mut prompt, event)? {
+                if !handle_terminal_input(&mut line, &mut prompt, event, None)? {
                     break;
                 }
                 continue;
@@ -1436,7 +1497,7 @@ fn main() -> io::Result<()> {
         if prompt.is_some() {
             if len == core::mem::size_of::<InputEvent>() {
                 let event = unsafe { core::ptr::read_unaligned(buf.as_ptr().cast::<InputEvent>()) };
-                let _ = handle_terminal_input(&mut line, &mut prompt, event)?;
+                let _ = handle_terminal_input(&mut line, &mut prompt, event, None)?;
                 continue;
             }
             if let Some(request) = parse_capability_request(payload) {
@@ -1453,7 +1514,7 @@ fn main() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EVENT_KIND_KEY, FLAG_PRESS, InputEvent};
+    use super::{EVENT_KIND_KEY, FLAG_PRESS, INPUT_MOD_CONTROL, InputEvent, is_interrupt_event};
 
     #[test]
     fn decodes_stdio_input_wire_as_little_endian() {
@@ -1472,5 +1533,25 @@ mod tests {
         assert_eq!(event.codepoint, 'x' as u32);
         assert_eq!(event.modifiers, 7);
         assert_eq!(event.reserved, 0);
+    }
+
+    #[test]
+    fn only_control_c_is_a_terminal_interrupt() {
+        let interrupt = InputEvent {
+            kind: EVENT_KIND_KEY,
+            flags: FLAG_PRESS,
+            codepoint: 'c' as u32,
+            modifiers: INPUT_MOD_CONTROL,
+            ..InputEvent::default()
+        };
+        assert!(is_interrupt_event(interrupt));
+        assert!(!is_interrupt_event(InputEvent {
+            modifiers: 0,
+            ..interrupt
+        }));
+        assert!(!is_interrupt_event(InputEvent {
+            codepoint: 'x' as u32,
+            ..interrupt
+        }));
     }
 }
