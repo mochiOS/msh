@@ -1,11 +1,10 @@
 use std::env;
 use std::ffi::CString;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 
 use mochi_user_syscall as syscall;
 use mochios_capability_protocol::{
@@ -32,9 +31,7 @@ const SPAWN_APP_OPCODE: u32 = 0x4150_5053;
 const CAPABILITY_SERVICE_NAME: &str = "capability.service";
 const EXEC_MANIFEST_ENV_PREFIX: &str = "__MOCHI_EXEC_ENV=";
 const SESSION_ENVIRONMENT_NAMES: [&str; 4] = ["HOME", "USER", "LOGNAME", "SHELL"];
-const LOG_ROOT: &str = "/system/logs/services";
 const MAX_APP_METADATA_BYTES: usize = 64 * 1024;
-const LOG_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const IPC_BUFFER_SIZE: usize = 2048;
 const TTY_OUTPUT_MAGIC: &[u8; 4] = b"TOUT";
 const STDIO_INPUT_ARG: &str = "--stdio-input";
@@ -42,16 +39,6 @@ const STDIN_FD: libc::c_int = 0;
 const MAX_STDIO_EVENTS_PER_TICK: usize = 256;
 
 static SHELL_ENDPOINT: AtomicU64 = AtomicU64::new(0);
-
-struct LogTail {
-    path: PathBuf,
-    offset: u64,
-}
-
-struct LogTailer {
-    logs: Vec<LogTail>,
-    next_poll: Instant,
-}
 
 enum InputMode {
     TtyEndpoint(u64),
@@ -123,77 +110,6 @@ impl StdioInput {
         }
         self.length = 0;
         Ok(Some(InputEvent::decode(&self.bytes)))
-    }
-}
-
-impl LogTailer {
-    fn new() -> Self {
-        Self {
-            logs: Vec::new(),
-            next_poll: Instant::now(),
-        }
-    }
-
-    fn poll(&mut self) -> io::Result<()> {
-        let now = Instant::now();
-        if now < self.next_poll {
-            return Ok(());
-        }
-        self.next_poll = now + LOG_POLL_INTERVAL;
-        self.refresh_logs();
-        for index in 0..self.logs.len() {
-            self.drain_log(index)?;
-        }
-        Ok(())
-    }
-
-    fn refresh_logs(&mut self) {
-        let Ok(entries) = fs::read_dir(LOG_ROOT) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("log") {
-                continue;
-            }
-            if self.logs.iter().any(|log| log.path == path) {
-                continue;
-            }
-            let offset = fs::metadata(&path)
-                .map(|metadata| metadata.len())
-                .unwrap_or(0);
-            self.logs.push(LogTail { path, offset });
-        }
-    }
-
-    fn drain_log(&mut self, index: usize) -> io::Result<()> {
-        let Some(log) = self.logs.get_mut(index) else {
-            return Ok(());
-        };
-        let metadata = match fs::metadata(&log.path) {
-            Ok(metadata) => metadata,
-            Err(_) => return Ok(()),
-        };
-        if metadata.len() < log.offset {
-            log.offset = 0;
-        }
-        if metadata.len() == log.offset {
-            return Ok(());
-        }
-        let mut file = File::open(&log.path)?;
-        use std::io::{Seek, SeekFrom};
-        file.seek(SeekFrom::Start(log.offset))?;
-        let mut output = Vec::new();
-        file.read_to_end(&mut output)?;
-        log.offset = metadata.len();
-        if output.is_empty() {
-            return Ok(());
-        }
-        io::stdout().write_all(&output)?;
-        if !output.ends_with(b"\n") {
-            io::stdout().write_all(b"\n")?;
-        }
-        io::stdout().flush()
     }
 }
 
@@ -1446,7 +1362,6 @@ fn main() -> io::Result<()> {
     let mut line = String::new();
     let mut buf = [0u8; IPC_BUFFER_SIZE];
     let mut prompt: Option<PendingPrompt> = None;
-    let mut log_tailer = LogTailer::new();
 
     print_prompt()?;
     loop {
@@ -1466,7 +1381,6 @@ fn main() -> io::Result<()> {
             continue;
         }
         let Some(msg) = ipc_try_wait(&mut buf)? else {
-            let _ = log_tailer.poll();
             let _ = syscall::call0(syscall::SyscallNumber::ThreadYield);
             continue;
         };
