@@ -29,7 +29,7 @@ const KEY_U: u16 = 52;
 const KEY_Y: u16 = 56;
 const SPAWN_APP_OPCODE: u32 = 0x4150_5053;
 const CAPABILITY_SERVICE_NAME: &str = "capability.service";
-const EXEC_MANIFEST_ENV_PREFIX: &str = "__MOCHI_EXEC_ENV=";
+const EXEC_MANIFEST_ENV_PREFIX: &str = "__MNU_EXEC_ENV=";
 const SESSION_ENVIRONMENT_NAMES: [&str; 4] = ["HOME", "USER", "LOGNAME", "SHELL"];
 const MAX_APP_METADATA_BYTES: usize = 64 * 1024;
 const IPC_BUFFER_SIZE: usize = 2048;
