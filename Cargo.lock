@@ -9,13 +9,10 @@ version = "0.2.185"
 [[package]]
 name = "mnu-abi"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "522a13d1239f1c600ea0cb0c871d48a98986ba36d5802417fe37c177a1245324"
 
 [[package]]
 name = "mochi-user-syscall"
 version = "0.1.0"
-source = "git+https://github.com/mochiOS/syscalls#e41ac7909a7ee11e9f89172d2e18db9a5a171f6f"
 dependencies = [
  "mnu-abi",
 ]
@@ -39,12 +36,12 @@ name = "mboot-protocol"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "mnu-abi"
-version = "0.1.0"
-
-[[patch.unused]]
 name = "viewkit"
 version = "2.0.0"
+
+[[patch.unused]]
+name = "mochios-mdriver-protocol"
+version = "0.1.0"
 
 [[patch.unused]]
 name = "rustc-std-workspace-alloc"
@@ -57,6 +54,34 @@ version = "1.99.0"
 [[patch.unused]]
 name = "viewkit"
 version = "2.0.0"
+
+[[patch.unused]]
+name = "mochi-user-platform"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-linux-gui-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-linux-portal-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-signature-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-tls-client"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-user-database"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "mochios-user-protocol"
+version = "0.1.0"
 
 [[patch.unused]]
 name = "mochios-viewkit-gpu-protocol"
