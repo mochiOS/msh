@@ -900,7 +900,9 @@ fn authorize_prompt_decision(
     let request = CapabilityDecisionRequest {
         opcode: CAPABILITY_DECISION_OPCODE,
         decision: capability_decision(decision),
-        reserved: prompt.request.process_id,
+        // The capability service resolves this unforgeable IPC endpoint back
+        // to the process that made the original prompt request.
+        reserved: prompt.sender,
         request: prompt.request,
     };
     let mut reply = [0u8; 8];
