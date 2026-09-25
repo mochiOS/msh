@@ -1,10 +1,13 @@
 use std::env;
 use std::ffi::CString;
 use std::fs;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+mod syntax;
 
 use mochi_user_syscall as syscall;
 use mochios_capability_protocol::{
@@ -481,6 +484,7 @@ fn spawn_external(
     argv: &[String],
     policy: &ExecutionPromptPolicy,
     foreground_input: Option<&mut StdioInput>,
+    redirects: &[syntax::Redirect],
 ) -> io::Result<()> {
     if argv.is_empty() {
         return Ok(());
@@ -521,13 +525,133 @@ fn spawn_external(
         return Ok(());
     }
 
-    let mut child = Command::new(&path)
+    let mut command = Command::new(&path);
+    command
         .args(&argv[1..])
         .env("MOCHI_EXECUTABLE_PATH", &path)
         .env("MOCHI_SHELL_ENDPOINT", shell_endpoint_str)
-        .env("MOCHI_PROMPT_MODE", prompt_mode.as_str())
-        .spawn()?;
+        .env("MOCHI_PROMPT_MODE", prompt_mode.as_str());
+    apply_redirects(&mut command, redirects)?;
+    let mut child = command.spawn()?;
     wait_foreground_child(&mut child, policy, foreground_input)
+}
+
+fn apply_redirects(command: &mut Command, redirects: &[syntax::Redirect]) -> io::Result<()> {
+    for redirect in redirects {
+        match redirect.kind {
+            syntax::RedirectKind::Input => {
+                command.stdin(Stdio::from(File::open(&redirect.path)?));
+            }
+            syntax::RedirectKind::Output => {
+                command.stdout(Stdio::from(
+                    OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(&redirect.path)?,
+                ));
+            }
+            syntax::RedirectKind::Append => {
+                command.stdout(Stdio::from(
+                    OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&redirect.path)?,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn builtin_output(redirects: &[syntax::Redirect]) -> io::Result<Box<dyn Write>> {
+    let mut output: Box<dyn Write> = Box::new(io::stdout());
+    for redirect in redirects {
+        match redirect.kind {
+            syntax::RedirectKind::Input => {}
+            syntax::RedirectKind::Output => {
+                output = Box::new(
+                    OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(&redirect.path)?,
+                );
+            }
+            syntax::RedirectKind::Append => {
+                output = Box::new(
+                    OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&redirect.path)?,
+                );
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn execute_pipeline(
+    pipeline: &syntax::Pipeline,
+    foreground_input: Option<&mut StdioInput>,
+) -> io::Result<()> {
+    let mut children: Vec<(Child, ExecutionPromptPolicy)> = Vec::new();
+    let mut previous_stdout = None;
+
+    for (index, command_spec) in pipeline.commands.iter().enumerate() {
+        let (policy, parsed_argv) = parse_external_options(&command_spec.argv)?;
+        if parsed_argv.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty pipeline command"));
+        }
+        let mut argv = parsed_argv.to_vec();
+        argv[0] = match argv[0].as_str() {
+            "echo" => "/bin/echo".into(),
+            "pwd" => "/bin/pwd".into(),
+            "cd" | "exit" => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} cannot be used in a pipeline", argv[0]),
+                ));
+            }
+            _ => resolve_command_path(&argv[0])?,
+        };
+        if argv[0].ends_with(".app") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "applications cannot be used in a pipeline",
+            ));
+        }
+        let shell_endpoint = SHELL_ENDPOINT.load(Ordering::Relaxed).to_string();
+        let prompt_mode = if policy.deny_prompts { "deny" } else { "interactive" };
+        let mut command = Command::new(&argv[0]);
+        command
+            .args(&argv[1..])
+            .env("MOCHI_EXECUTABLE_PATH", &argv[0])
+            .env("MOCHI_SHELL_ENDPOINT", &shell_endpoint)
+            .env("MOCHI_PROMPT_MODE", prompt_mode);
+        if let Some(stdout) = previous_stdout.take() {
+            command.stdin(Stdio::from(stdout));
+        } else if index != 0 {
+            command.stdin(Stdio::null());
+        }
+        let last = index + 1 == pipeline.commands.len();
+        if !last {
+            command.stdout(Stdio::piped());
+        }
+        apply_redirects(&mut command, &command_spec.redirects)?;
+        let mut child = command.spawn()?;
+        previous_stdout = if last { None } else { child.stdout.take() };
+        children.push((child, policy));
+    }
+
+    let Some((mut last, last_policy)) = children.pop() else {
+        return Ok(());
+    };
+    wait_foreground_child(&mut last, &last_policy, foreground_input)?;
+    for (mut child, _) in children {
+        let _ = child.wait();
+    }
+    Ok(())
 }
 
 fn encode_nul_list(items: &[String]) -> Vec<u8> {
@@ -724,7 +848,23 @@ unsafe fn write_execve_failed_result(result: i64) {
 }
 
 fn run_command(line: &str, foreground_input: Option<&mut StdioInput>) -> io::Result<bool> {
-    let argv: Vec<String> = line.split_whitespace().map(ToOwned::to_owned).collect();
+    let pipeline = match syntax::parse_pipeline(line) {
+        Ok(pipeline) => pipeline,
+        Err(error) => {
+            eprintln!("msh: syntax error: {error}");
+            return Ok(true);
+        }
+    };
+    if pipeline.commands.len() > 1 {
+        if let Err(error) = execute_pipeline(&pipeline, foreground_input) {
+            eprintln!("msh: {error}");
+        }
+        return Ok(true);
+    }
+    let Some(command) = pipeline.commands.first() else {
+        return Ok(true);
+    };
+    let argv = &command.argv;
     if argv.is_empty() {
         return Ok(true);
     }
@@ -732,11 +872,13 @@ fn run_command(line: &str, foreground_input: Option<&mut StdioInput>) -> io::Res
     match argv[0].as_str() {
         "exit" => Ok(false),
         "echo" => {
-            println!("{}", argv[1..].join(" "));
+            let mut output = builtin_output(&command.redirects)?;
+            writeln!(output, "{}", argv[1..].join(" "))?;
             Ok(true)
         }
         "pwd" => {
-            println!("{}", env::current_dir()?.display());
+            let mut output = builtin_output(&command.redirects)?;
+            writeln!(output, "{}", env::current_dir()?.display())?;
             Ok(true)
         }
         "cd" => {
@@ -754,18 +896,12 @@ fn run_command(line: &str, foreground_input: Option<&mut StdioInput>) -> io::Res
                 );
                 return Ok(true);
             }
-            let path = match resolve_command_path(&external_argv[0]) {
-                Ok(path) => path,
-                Err(error) => {
-                    eprintln!("{}: {error}", external_argv[0]);
-                    return Ok(true);
-                }
-            };
-            if !path.ends_with(".app") && fs::metadata(&path).is_err() {
-                println!("notfound");
-                return Ok(true);
-            }
-            if let Err(error) = spawn_external(external_argv, &policy, foreground_input) {
+            if let Err(error) = spawn_external(
+                external_argv,
+                &policy,
+                foreground_input,
+                &command.redirects,
+            ) {
                 eprintln!("{}: {error}", external_argv[0]);
             }
             Ok(true)
@@ -864,8 +1000,10 @@ fn handle_terminal_input(
     let Some(command) = handle_key_event(line, event)? else {
         return Ok(true);
     };
-    if !run_command(&command, foreground_input)? {
-        return Ok(false);
+    match run_command(&command, foreground_input) {
+        Ok(false) => return Ok(false),
+        Ok(true) => {}
+        Err(error) => eprintln!("msh: {error}"),
     }
     print_prompt()?;
     Ok(true)
