@@ -320,14 +320,7 @@ fn resolve_command_path(cmd: &str) -> io::Result<String> {
 }
 
 fn resolve_app_entry(app_root: &Path) -> io::Result<PathBuf> {
-    let about_path = app_root.join("about.toml");
     let manifest_path = app_root.join("manifest.toml");
-    let about = read_text_file_bounded(&about_path, MAX_APP_METADATA_BYTES).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("{}: app about.toml not found", app_root.display()),
-        )
-    })?;
     let manifest =
         read_text_file_bounded(&manifest_path, MAX_APP_METADATA_BYTES).map_err(|_| {
             io::Error::new(
@@ -336,8 +329,7 @@ fn resolve_app_entry(app_root: &Path) -> io::Result<PathBuf> {
             )
         })?;
 
-    let entry = parse_toml_string_field(&about, "entry")
-        .or_else(|| parse_toml_string_field(&manifest, "path"))
+    let entry = parse_toml_string_field(&manifest, "entry")
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
