@@ -792,18 +792,17 @@ fn spawn_external_direct(
         let argv_ptr = argv.as_ptr();
         let envp_ptr = envp.as_ptr();
         unsafe {
-            let result = syscall::raw_syscall3(
-                syscall::SyscallNumber::Execve,
-                exec_path_ptr as u64,
-                argv_ptr as u64,
-                envp_ptr as u64,
-            );
-            write_execve_failed_result(result.raw() as i64);
+            libc::execve(exec_path_ptr, argv_ptr, envp_ptr);
+            write_execve_failed_result(-i64::from(*__errno()));
             libc::_exit(127);
         }
     }
     eprintln!("msh: forked child pid={pid}");
     Ok(pid)
+}
+
+unsafe extern "C" {
+    fn __errno() -> *mut libc::c_int;
 }
 
 unsafe fn write_execve_failed_result(result: i64) {
