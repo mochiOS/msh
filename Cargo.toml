@@ -7,6 +7,7 @@ edition = "2024"
 
 [dependencies]
 libc = { git = "https://github.com/mochiOS/libc", package = "libc" }
+mochi-user-platform = { git = "https://github.com/mochiOS/syscalls", package = "mochi-user-platform", default-features = false, features = ["std"] }
 mochi-user-syscall = { git = "https://github.com/mochiOS/syscalls", package = "mochi-user-syscall" }
 mochios-capability-protocol = { git = "https://github.com/mochiOS/syscalls", package = "mochios-capability-protocol" }
 

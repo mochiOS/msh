@@ -11,6 +11,16 @@ name = "mnu-abi"
 version = "0.1.0"
 
 [[package]]
+name = "mochi-user-platform"
+version = "0.1.0"
+dependencies = [
+ "mnu-abi",
+ "mochi-user-syscall",
+ "mochios-capability-protocol",
+ "mochios-workspace-protocol",
+]
+
+[[package]]
 name = "mochi-user-syscall"
 version = "0.1.0"
 dependencies = [
@@ -22,10 +32,15 @@ name = "mochios-capability-protocol"
 version = "0.1.0"
 
 [[package]]
+name = "mochios-workspace-protocol"
+version = "0.1.0"
+
+[[package]]
 name = "msh"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "mochi-user-platform",
  "mochi-user-syscall",
  "mochios-capability-protocol",
 ]
@@ -53,10 +68,6 @@ version = "1.99.0"
 [[patch.unused]]
 name = "viewkit"
 version = "2.0.0"
-
-[[patch.unused]]
-name = "mochi-user-platform"
-version = "0.1.0"
 
 [[patch.unused]]
 name = "mochios-linux-gui-protocol"

@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 mod syntax;
 
+use mochi_user_platform as platform;
 use mochi_user_syscall as syscall;
 use mochios_capability_protocol::{
     CAPABILITY_DECISION_OPCODE, CapabilityClass, CapabilityDecision, CapabilityDecisionRequest,
@@ -1067,7 +1068,7 @@ fn ipc_create() -> io::Result<u64> {
 }
 
 fn current_thread_id() -> io::Result<u64> {
-    syscall::call0(syscall::SyscallNumber::GetTid).map_err(sys_error_to_io)
+    platform::process::current_thread_id().map_err(sys_error_to_io)
 }
 
 fn ipc_send(endpoint: u64, bytes: &[u8]) -> io::Result<()> {
