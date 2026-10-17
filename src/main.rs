@@ -20,7 +20,6 @@ const EVENT_KIND_KEY: u16 = 1;
 const FLAG_PRESS: u16 = 1 << 0;
 const INPUT_MOD_CONTROL: u32 = 1 << 1;
 const EAGAIN: i32 = 11;
-const EAGAIN_U64: u64 = 11;
 
 const KEY_BACKSPACE: u16 = 2;
 const KEY_TAB: u16 = 3;
@@ -1099,7 +1098,7 @@ fn ipc_try_wait(buf: &mut [u8]) -> io::Result<Option<u64>> {
         0,
     ) {
         Ok(msg) => Ok(Some(msg)),
-        Err(err) if err.errno() == Some(EAGAIN_U64) => Ok(None),
+        Err(err) if err.native_error() == Some(syscall::NativeError::NotReady) => Ok(None),
         Err(err) => Err(sys_error_to_io(err)),
     }
 }
