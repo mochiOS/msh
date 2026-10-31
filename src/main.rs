@@ -21,6 +21,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod command;
+mod job_state;
+mod pty_shell;
 mod syntax;
 
 use mochi_user_platform as platform;
@@ -60,6 +62,7 @@ static SHELL_ENDPOINT: AtomicU64 = AtomicU64::new(0);
 enum InputMode {
     TtyEndpoint(u64),
     Stdio,
+    Pty { login: bool },
 }
 
 struct StdioInput {
@@ -228,7 +231,7 @@ fn prompt_string() -> String {
 }
 
 fn print_prompt() -> io::Result<()> {
-    print!("{}", prompt_string());
+    write!(io::stdout(), "{}", prompt_string())?;
     io::stdout().flush()
 }
 
@@ -760,6 +763,12 @@ fn run_command(line: &str, foreground_input: Option<&mut StdioInput>) -> io::Res
             return Ok(true);
         }
     };
+    if pipeline.background {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "background jobs require a POSIX terminal",
+        ));
+    }
     if pipeline.commands.len() > 1 {
         if let Err(error) = execute_pipeline(&pipeline, foreground_input) {
             eprintln!("msh: {error}");
@@ -1015,6 +1024,28 @@ fn ipc_try_wait(buf: &mut [u8]) -> io::Result<Option<u64>> {
         Err(err) if err.native_error() == Some(syscall::NativeError::NotReady) => Ok(None),
         Err(err) => Err(sys_error_to_io(err)),
     }
+}
+
+// The POSIX terminal path never treats stdin or an arbitrary key packet as
+// consent. New grants require the broker's protected presenter/input route.
+fn drain_terminal_feedback() -> io::Result<()> {
+    let mut buffer = [0; IPC_BUFFER_SIZE];
+    for _ in 0..16 {
+        let Some(message) = ipc_try_wait(&mut buffer)? else {
+            break;
+        };
+        let length = (message as u32 as usize).min(buffer.len());
+        let payload = &buffer[..length];
+        if let Some(request) = parse_capability_request(payload) {
+            reply_prompt(
+                &PendingPrompt { sender: message >> 32, request },
+                PromptDecision::Deny,
+            );
+        } else if !print_tty_output(payload)? && length != core::mem::size_of::<InputEvent>() {
+            print_ipc_payload(payload)?;
+        }
+    }
+    Ok(())
 }
 
 fn wait_foreground_child(
@@ -1329,8 +1360,14 @@ fn wait_app_bundle_launch_result(
 fn parse_input_mode() -> io::Result<InputMode> {
     let mut args = env::args();
     let _program = args.next();
-    let argument = args
-        .next()
+    let argument = args.next();
+    if argument.as_deref() == Some("--login-tty") {
+        return Ok(InputMode::Pty { login: true });
+    }
+    if argument.is_none() && unsafe { libc::isatty(0) } == 1 {
+        return Ok(InputMode::Pty { login: false });
+    }
+    let argument = argument
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing endpoint arg"))?;
     if argument == STDIO_INPUT_ARG {
         return Ok(InputMode::Stdio);
@@ -1353,6 +1390,9 @@ fn main() -> io::Result<()> {
     let input_mode = parse_input_mode()?;
     let endpoint = ipc_create()?;
     SHELL_ENDPOINT.store(endpoint, Ordering::Relaxed);
+    if let InputMode::Pty { login } = input_mode {
+        return pty_shell::run(login);
+    }
     #[cfg(mochios_pty_launch_probe_310)]
     if env::args().any(|argument| argument == "--pty-launch-child-310") {
         pty_launch_probe::run();
@@ -1373,6 +1413,7 @@ fn main() -> io::Result<()> {
             None
         }
         InputMode::Stdio => Some(StdioInput::new()?),
+        InputMode::Pty { .. } => unreachable!(),
     };
     let mut line = String::new();
     let mut buf = [0u8; IPC_BUFFER_SIZE];

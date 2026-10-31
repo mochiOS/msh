@@ -22,6 +22,7 @@ pub(crate) struct CommandSpec {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Pipeline {
     pub(crate) commands: Vec<CommandSpec>,
+    pub(crate) background: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,6 +32,7 @@ enum Token {
     Input,
     Output,
     Append,
+    Background,
 }
 
 pub(crate) fn parse_pipeline(source: &str) -> Result<Pipeline, String> {
@@ -40,6 +42,12 @@ pub(crate) fn parse_pipeline(source: &str) -> Result<Pipeline, String> {
     let mut index = 0;
     while index < tokens.len() {
         match &tokens[index] {
+            Token::Background => {
+                if index + 1 != tokens.len() || command.argv.is_empty() {
+                    return Err("'&' must terminate a command".into());
+                }
+                pipeline.background = true;
+            }
             Token::Word(word) => command.argv.push(word.clone()),
             Token::Pipe => {
                 if command.argv.is_empty() {
@@ -134,7 +142,7 @@ fn lex(source: &str) -> Result<Vec<Token>, String> {
                 expand_variable(&chars, &mut index, &mut word)?;
                 word_started = true;
             }
-            '|' | '<' | '>' => {
+            '|' | '<' | '>' | '&' => {
                 finish_word(&mut tokens, &mut word, &mut word_started);
                 if character == '>' && chars.get(index + 1) == Some(&'>') {
                     tokens.push(Token::Append);
@@ -144,6 +152,7 @@ fn lex(source: &str) -> Result<Vec<Token>, String> {
                         '|' => Token::Pipe,
                         '<' => Token::Input,
                         '>' => Token::Output,
+                        '&' => Token::Background,
                         _ => unreachable!(),
                     });
                 }
