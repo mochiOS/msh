@@ -58,6 +58,10 @@ name = "viewkit"
 version = "2.0.0"
 
 [[patch.unused]]
+name = "mochios-mdriver-protocol"
+version = "0.1.0"
+
+[[patch.unused]]
 name = "viewkit"
 version = "2.0.0"
 
