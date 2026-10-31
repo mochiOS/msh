@@ -4,6 +4,9 @@ mod verified_launch_probe;
 #[cfg(mochios_process_domain_probe_308)]
 #[path = "../../../services/posix/tests/support/process_domain_msh_308.rs"]
 mod process_domain_probe;
+#[cfg(mochios_command_search_probe_309)]
+#[path = "../../../services/posix/tests/support/command_search_msh_309.rs"]
+mod command_search_probe;
 
 use std::env;
 use std::ffi::CString;
@@ -14,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod command;
 mod syntax;
 
 use mochi_user_platform as platform;
@@ -320,7 +324,8 @@ fn resolve_command_path(cmd: &str) -> io::Result<String> {
     } else if cmd.ends_with(".app") {
         resolve_app_entry(&PathBuf::from("/applications").join(cmd))?
     } else {
-        return Ok(format!("/bin/{cmd}"));
+        // Leave PATH search to the shared POSIX exec/spawn implementation.
+        return Ok(cmd.to_owned());
     };
 
     Ok(path.to_string_lossy().into_owned())
@@ -499,7 +504,6 @@ fn spawn_external(
     let path = resolve_command_path(&argv[0])?;
     let shell_endpoint = SHELL_ENDPOINT.load(Ordering::Relaxed);
     let shell_endpoint_str = shell_endpoint.to_string();
-    let shell_target_str = current_thread_id()?.to_string();
     let prompt_mode = if policy.deny_prompts {
         String::from("deny")
     } else {
@@ -508,8 +512,10 @@ fn spawn_external(
 
     if policy.background {
         eprintln!("msh: background launch path for {}", argv[0]);
-        spawn_external_direct(&path, &argv[1..], &shell_endpoint_str, prompt_mode.as_str())?;
-        return wait_background_capability_request(shell_endpoint, policy);
+        let mut command = command::create(&path, &argv[1..], &shell_endpoint_str, &prompt_mode);
+        apply_redirects(&mut command, redirects)?;
+        let mut child = command.spawn()?;
+        return wait_foreground_child(&mut child, policy, None);
     }
 
     if is_app_bundle {
@@ -524,12 +530,7 @@ fn spawn_external(
         return Ok(());
     }
 
-    let mut command = Command::new(&path);
-    command
-        .args(&argv[1..])
-        .env("MOCHI_EXECUTABLE_PATH", &path)
-        .env("MOCHI_SHELL_ENDPOINT", shell_endpoint_str)
-        .env("MOCHI_PROMPT_MODE", prompt_mode.as_str());
+    let mut command = command::create(&path, &argv[1..], &shell_endpoint_str, &prompt_mode);
     apply_redirects(&mut command, redirects)?;
     let mut child = command.spawn()?;
     wait_foreground_child(&mut child, policy, foreground_input)
@@ -604,8 +605,6 @@ fn execute_pipeline(
         }
         let mut argv = parsed_argv.to_vec();
         argv[0] = match argv[0].as_str() {
-            "echo" => "/bin/echo".into(),
-            "pwd" => "/bin/pwd".into(),
             "cd" | "exit" => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -622,12 +621,7 @@ fn execute_pipeline(
         }
         let shell_endpoint = SHELL_ENDPOINT.load(Ordering::Relaxed).to_string();
         let prompt_mode = if policy.deny_prompts { "deny" } else { "interactive" };
-        let mut command = Command::new(&argv[0]);
-        command
-            .args(&argv[1..])
-            .env("MOCHI_EXECUTABLE_PATH", &argv[0])
-            .env("MOCHI_SHELL_ENDPOINT", &shell_endpoint)
-            .env("MOCHI_PROMPT_MODE", prompt_mode);
+        let mut command = command::create(&argv[0], &argv[1..], &shell_endpoint, prompt_mode);
         if let Some(stdout) = previous_stdout.take() {
             command.stdin(Stdio::from(stdout));
         } else if index != 0 {
@@ -753,96 +747,6 @@ fn spawn_app_bundle_manifest(
         ));
     }
     Ok(pid as i32)
-}
-
-fn spawn_external_direct(
-    path: &str,
-    args: &[String],
-    shell_endpoint: &str,
-    prompt_mode: &str,
-) -> io::Result<i32> {
-    let c_path = CString::new(path)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid executable path"))?;
-    let mut c_args = Vec::with_capacity(args.len() + 1);
-    c_args.push(c_path.clone());
-    for arg in args {
-        c_args.push(
-            CString::new(arg.as_str())
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid argument"))?,
-        );
-    }
-    let env_exe = CString::new(format!("MOCHI_EXECUTABLE_PATH={path}"))
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid executable path"))?;
-    let env_shell = CString::new(format!("MOCHI_SHELL_ENDPOINT={shell_endpoint}"))
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid shell endpoint"))?;
-    let env_prompt = CString::new(format!("MOCHI_PROMPT_MODE={prompt_mode}"))
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid prompt mode"))?;
-
-    eprintln!("msh: fork exec {}", path);
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        let error = io::Error::last_os_error();
-        eprintln!("msh: fork failed: {error}");
-        return Err(error);
-    }
-    if pid == 0 {
-        let mut argv: Vec<*const i8> = c_args.iter().map(|arg| arg.as_ptr()).collect();
-        argv.push(core::ptr::null());
-        let exec_path_ptr = argv[0];
-        let envp = [
-            env_exe.as_ptr(),
-            env_shell.as_ptr(),
-            env_prompt.as_ptr(),
-            core::ptr::null(),
-        ];
-        let argv_ptr = argv.as_ptr();
-        let envp_ptr = envp.as_ptr();
-        unsafe {
-            libc::execve(exec_path_ptr, argv_ptr, envp_ptr);
-            write_execve_failed_result(-i64::from(*__errno()));
-            libc::_exit(127);
-        }
-    }
-    eprintln!("msh: forked child pid={pid}");
-    Ok(pid)
-}
-
-unsafe extern "C" {
-    fn __errno() -> *mut libc::c_int;
-}
-
-unsafe fn write_execve_failed_result(result: i64) {
-    let errno = if result < 0 {
-        result.saturating_neg() as u32
-    } else {
-        result as u32
-    };
-    let mut buf = [0u8; 48];
-    let prefix = b"msh: execve failed errno=";
-    let mut len = prefix.len();
-    buf[..prefix.len()].copy_from_slice(prefix);
-
-    if errno == 0 {
-        buf[len] = b'0';
-        len += 1;
-    } else {
-        let mut value = errno;
-        let mut digits = [0u8; 10];
-        let mut digit_len = 0usize;
-        while value != 0 && digit_len < digits.len() {
-            digits[digit_len] = b'0' + (value % 10) as u8;
-            value /= 10;
-            digit_len += 1;
-        }
-        while digit_len != 0 {
-            digit_len -= 1;
-            buf[len] = digits[digit_len];
-            len += 1;
-        }
-    }
-    buf[len] = b'\n';
-    len += 1;
-    let _ = unsafe { libc::write(2, buf.as_ptr().cast(), len) };
 }
 
 fn run_command(line: &str, foreground_input: Option<&mut StdioInput>) -> io::Result<bool> {
@@ -1272,46 +1176,6 @@ fn interrupt_foreground(pid: i32) -> io::Result<()> {
     }
 }
 
-fn wait_background_capability_request(
-    endpoint: u64,
-    policy: &ExecutionPromptPolicy,
-) -> io::Result<()> {
-    let mut buf = [0u8; IPC_BUFFER_SIZE];
-    for _ in 0..65_536 {
-        let msg = match ipc_wait(endpoint, &mut buf) {
-            Ok(msg) => msg,
-            Err(error) if error.raw_os_error() == Some(EAGAIN) => {
-                let _ = syscall::call0(syscall::SyscallNumber::ThreadYield);
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        let len = (msg & 0xffff_ffff) as usize;
-        let payload = &buf[..len.min(buf.len())];
-        if print_tty_output(payload)? {
-            continue;
-        }
-        if let Some(request) = parse_capability_request(payload) {
-            let current = PendingPrompt {
-                sender: msg >> 32,
-                request,
-            };
-            if let Some(decision) = prompt_policy_decision(policy, &current.request) {
-                reply_prompt(&current, decision);
-                return Ok(());
-            }
-            print_capability_prompt(&current.request)?;
-            return Ok(());
-        } else {
-            print_ipc_payload(payload)?;
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::TimedOut,
-        "background command did not request a session capability",
-    ))
-}
-
 fn spawn_app_bundle_with_prompt(
     path: &str,
     args: &[String],
@@ -1486,6 +1350,8 @@ fn main() -> io::Result<()> {
     let input_mode = parse_input_mode()?;
     let endpoint = ipc_create()?;
     SHELL_ENDPOINT.store(endpoint, Ordering::Relaxed);
+    #[cfg(mochios_command_search_probe_309)]
+    command_search_probe::run();
     #[cfg(mochios_process_domain_probe_308)]
     process_domain_probe::run();
     #[cfg(mochios_verified_launch_probe_305)]
