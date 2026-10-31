@@ -1,6 +1,9 @@
 #[cfg(mochios_verified_launch_probe_305)]
 #[path = "../../../services/posix/tests/support/verified_launch_msh_305.rs"]
 mod verified_launch_probe;
+#[cfg(mochios_process_domain_probe_308)]
+#[path = "../../../services/posix/tests/support/process_domain_msh_308.rs"]
+mod process_domain_probe;
 
 use std::env;
 use std::ffi::CString;
@@ -1483,6 +1486,8 @@ fn main() -> io::Result<()> {
     let input_mode = parse_input_mode()?;
     let endpoint = ipc_create()?;
     SHELL_ENDPOINT.store(endpoint, Ordering::Relaxed);
+    #[cfg(mochios_process_domain_probe_308)]
+    process_domain_probe::run();
     #[cfg(mochios_verified_launch_probe_305)]
     verified_launch_probe::run(endpoint);
     let mut stdio_input = match input_mode {
