@@ -7,6 +7,9 @@ mod process_domain_probe;
 #[cfg(mochios_command_search_probe_309)]
 #[path = "../../../services/posix/tests/support/command_search_msh_309.rs"]
 mod command_search_probe;
+#[cfg(mochios_pty_launch_probe_310)]
+#[path = "../../../services/posix/tests/support/pty_launch_msh_310.rs"]
+mod pty_launch_probe;
 
 use std::env;
 use std::ffi::CString;
@@ -1350,6 +1353,10 @@ fn main() -> io::Result<()> {
     let input_mode = parse_input_mode()?;
     let endpoint = ipc_create()?;
     SHELL_ENDPOINT.store(endpoint, Ordering::Relaxed);
+    #[cfg(mochios_pty_launch_probe_310)]
+    if env::args().any(|argument| argument == "--pty-launch-child-310") {
+        pty_launch_probe::run();
+    }
     #[cfg(mochios_command_search_probe_309)]
     command_search_probe::run();
     #[cfg(mochios_process_domain_probe_308)]
