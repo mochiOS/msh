@@ -58,6 +58,7 @@ const STDIN_FD: libc::c_int = 0;
 const MAX_STDIO_EVENTS_PER_TICK: usize = 256;
 
 static SHELL_ENDPOINT: AtomicU64 = AtomicU64::new(0);
+static INPUT_ENDPOINT: AtomicU64 = AtomicU64::new(0);
 
 enum InputMode {
     TtyEndpoint(u64),
@@ -1020,7 +1021,15 @@ fn ipc_try_wait(buf: &mut [u8]) -> io::Result<Option<u64>> {
         buf.len() as u64,
         0,
     ) {
-        Ok(msg) => Ok(Some(msg)),
+        Ok(msg) => {
+            if msg as u32 as usize == core::mem::size_of::<InputEvent>() {
+                let input = INPUT_ENDPOINT.load(Ordering::Relaxed);
+                if input == 0 || msg >> 32 != input {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(msg))
+        }
         Err(err) if err.native_error() == Some(syscall::NativeError::NotReady) => Ok(None),
         Err(err) => Err(sys_error_to_io(err)),
     }
@@ -1405,6 +1414,18 @@ fn main() -> io::Result<()> {
     verified_launch_probe::run(endpoint);
     let mut stdio_input = match input_mode {
         InputMode::TtyEndpoint(tty_endpoint) => {
+            let peer = platform::execution_peer::capture(tty_endpoint).map_err(sys_error_to_io)?;
+            let context = &peer.context;
+            if context.provenance != 1
+                || context.subject_key_id != [0; 32]
+                || context.package_id.get(..context.package_id_len as usize)
+                    != Some(b"org.mochios.tty")
+                || context.developer_id.get(..context.developer_id_len as usize)
+                    != Some(b"org.mochios.system")
+            {
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
+            INPUT_ENDPOINT.store(tty_endpoint, Ordering::Relaxed);
             let thread_id = current_thread_id()?;
             let mut shell_targets = [0u8; 16];
             shell_targets[..8].copy_from_slice(&endpoint.to_le_bytes());
