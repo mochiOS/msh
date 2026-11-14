@@ -1,0 +1,44 @@
+{
+  "format": 1,
+  "steps": [
+    "$(MOCHIOS_CARGO) --manifest-path $(PROJECT)/Cargo.toml --bin msh"
+  ],
+  "package": {
+    "name": "msh",
+    "version": "0.1.0",
+    "target": "x86_64-mochios",
+    "abi": "mochios-1"
+  },
+  "artifact": "out/mdp/msh.tar.mdp",
+  "exports": [
+    {
+      "source": "$(RUST_TARGET_DIR)/x86_64-unknown-mochios/release/msh",
+      "area": "system",
+      "destination": "bin/msh",
+      "mode": 493,
+      "when": {}
+    },
+    {
+      "source": "manifest.toml",
+      "area": "manifests",
+      "destination": "msh.toml"
+    },
+    {
+      "source": "resources/ter-u12b.bdf",
+      "area": "system",
+      "destination": "resources/msh/ter-u12b.bdf"
+    }
+  ],
+  "metadata": {
+    "builtins": [
+      {
+        "manifest": "msh.toml",
+        "directory": "msh",
+        "maps": [
+          "/bin=/system/bin"
+        ],
+        "coreutils": false
+      }
+    ]
+  }
+}
